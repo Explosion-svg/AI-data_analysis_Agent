@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from ai_data_agent.assembler import get_container
 from ai_data_agent.evaluation.benchmark_dataset import BenchmarkDataset, EvalCase, get_default_dataset
 from ai_data_agent.orchestration.agent_loop import AgentLoop, AgentResponse
 from ai_data_agent.observability.logger import get_logger
@@ -82,7 +83,7 @@ class EvalRunner:
         sem: asyncio.Semaphore,
     ) -> EvalResult:
         async with sem:
-            agent = AgentLoop()
+            agent = get_container().get_agent_loop()
             start = time.perf_counter()
             result = EvalResult(case_id=case.id, question=case.question)
             try:

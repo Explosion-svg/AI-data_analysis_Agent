@@ -82,7 +82,7 @@ class OpenAIModel(BaseLLM):
 
             resp = await self._client.chat.completions.create(**kwargs)
             choice = resp.choices[0]
-            content = choice.message.content or ""
+            content = choice.message.content or ""  # 模型回答content
             tool_calls = None
             if choice.message.tool_calls:
                 # 每个tool_call是List[ChatCompletionMessageToolCall]对象Object，把返回的SDK对象转换为json dict

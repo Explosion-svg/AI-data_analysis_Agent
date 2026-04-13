@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ai_data_agent.tools.tool_registry import ToolRegistry
     from ai_data_agent.memory.conversation_memory import ConversationMemory
     from ai_data_agent.memory.cache_memory import CacheMemory
+    from ai_data_agent.memory.work_memory import WorkMemory
     from ai_data_agent.context.prompt_builder import PromptBuilder
     from ai_data_agent.context.query_rewriter import QueryRewriter
     from ai_data_agent.context.schema_context import SchemaContextBuilder
@@ -90,6 +91,7 @@ class AppContainer:
     # Memory
     conversation_memory: "ConversationMemory | None" = field(default=None, init=False)
     cache: "CacheMemory | None" = field(default=None, init=False)
+    work_memory: "WorkMemory | None" = field(default=None, init=False)
 
     # Orchestration
     planner: "Planner | None" = field(default=None, init=False)
@@ -223,23 +225,32 @@ class AppContainer:
         logger.debug("assembler.context_ready")
 
     async def _init_memory(self) -> None:
-        """Step 6：Memory — 对话历史 + 缓存"""
+        """Step 6：Memory — 对话历史 + 缓存 + 工作记忆"""
         from ai_data_agent.memory.conversation_memory import ConversationMemory
         from ai_data_agent.memory.cache_memory import CacheMemory
+        from ai_data_agent.memory.work_memory import WorkMemory
+        from ai_data_agent.reliability.circuit_breaker import get_breaker
+
+        assert self.router is not None
 
         self.conversation_memory = ConversationMemory(
-            max_turns=self.cfg.conversation_max_turns
+            max_turns=self.cfg.conversation_max_turns,
+            router=self.router,
+            breaker=get_breaker("llm"),
         )
         self.cache = CacheMemory(
             max_size=self.cfg.cache_max_size,
             ttl_seconds=self.cfg.cache_ttl_seconds,
         )
+        self.work_memory = WorkMemory()
 
         # 同步到全局单例
         from ai_data_agent.memory import conversation_memory as _cm_mod
         from ai_data_agent.memory import cache_memory as _cache_mod
+        from ai_data_agent.memory import work_memory as _wm_mod
         _cm_mod._memory = self.conversation_memory
         _cache_mod._cache = self.cache
+        _wm_mod._work_memory = self.work_memory
 
         logger.debug("assembler.memory_ready")
 
@@ -248,10 +259,30 @@ class AppContainer:
         from ai_data_agent.orchestration.planner import Planner
         from ai_data_agent.orchestration.executor import Executor
         from ai_data_agent.orchestration.agent_loop import AgentLoop
+        from ai_data_agent.reliability.circuit_breaker import get_breaker
 
         self.planner = Planner()
         self.executor = Executor()
-        self.agent_loop = AgentLoop()
+        assert self.prompt_builder is not None
+        assert self.query_rewriter is not None
+        assert self.schema_builder is not None
+        assert self.conversation_memory is not None
+        assert self.cache is not None
+        assert self.work_memory is not None
+        assert self.tool_registry is not None
+        assert self.router is not None
+
+        self.agent_loop = AgentLoop(
+            prompt_builder=self.prompt_builder,
+            query_rewriter=self.query_rewriter,
+            schema_builder=self.schema_builder,
+            memory=self.conversation_memory,
+            cache=self.cache,
+            work_memory=self.work_memory,
+            registry=self.tool_registry,
+            router=self.router,
+            breaker=get_breaker("llm"),
+        )
         logger.debug("assembler.orchestration_ready")
 
     async def _post_startup(self) -> None:
@@ -284,10 +315,15 @@ class AppContainer:
         assert self.cache is not None, "Container not started."
         return self.cache
 
+    def get_work_memory(self) -> "WorkMemory":
+        assert self.work_memory is not None, "Container not started."
+        return self.work_memory
+
     # ── 诊断 ─────────────────────────────────────────────────────────────────
 
     def health_report(self) -> dict:
         """返回各组件健康状态，供运维巡检使用。"""
+
         return {
             "started": self._started,
             "infra": {
@@ -306,6 +342,7 @@ class AppContainer:
             "memory": {
                 "conversation": self.conversation_memory is not None,
                 "cache": self.cache.stats() if self.cache else None,
+                "work_memory": self.work_memory.stats() if self.work_memory else None,
             },
             "orchestration": {
                 "planner": self.planner is not None,

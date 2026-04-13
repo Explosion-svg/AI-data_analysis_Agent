@@ -5,6 +5,8 @@ context/schema_context.py — Schema 上下文构建器
 """
 from __future__ import annotations
 
+import re
+
 from ai_data_agent.infra import warehouse, vector_store
 from ai_data_agent.model_gateway.router import get_router
 from ai_data_agent.observability.logger import get_logger
@@ -20,6 +22,15 @@ _MAX_TABLES_IN_PROMPT = 8
 class SchemaContextBuilder:
     """
     为 LLM 构建精简的 schema 上下文字符串。
+
+    这个类只负责 schema 相关的事情：
+    - 选表
+    - 格式化 schema prompt
+    - 从 schema prompt 中恢复结构化表名
+
+    这样 orchestration 层只消费“schema 结果”，不再自己解析 schema 文本，
+    可以避免 agent_loop 同时承担流程控制和 schema 解析两类职责。
+
     策略：
       1. 语义搜索 schema 向量库，找最相关的表
       2. 若向量库为空，退化为全量 schema（截断到 _MAX_TABLES_IN_PROMPT）
@@ -69,6 +80,20 @@ class SchemaContextBuilder:
             total_tables=len(all_tables),
         )
         return schema_str
+
+    @staticmethod
+    def extract_table_names(schema_context: str) -> list[str]:
+        """
+        从 schema prompt 文本中提取表名。
+
+        当前 build() 输出的稳定格式是：
+            ### Table: `table_name`
+
+        work_memory 需要记录“本轮任务实际涉及了哪些表”，
+        但这个记录属于 schema 结果的派生信息，因此解析逻辑放在 schema_context
+        模块内比放在 agent_loop 里更符合单一职责。
+        """
+        return re.findall(r"### Table: `([^`]+)`", schema_context)
 
     async def _select_relevant_tables(
         self,

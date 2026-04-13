@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+from ai_data_agent.assembler import get_container
 from ai_data_agent.config.config import settings
 from ai_data_agent.orchestration.agent_loop import AgentLoop, AgentResponse
 from ai_data_agent.observability.logger import get_logger
@@ -65,7 +66,7 @@ class ErrorResponse(BaseModel):
 # ── 依赖注入 ──────────────────────────────────────────────────────────────────
 
 def _get_agent_loop() -> AgentLoop:
-    return AgentLoop()
+    return get_container().get_agent_loop()
 
 
 def _verify_api_key(
@@ -163,5 +164,7 @@ async def health() -> HealthResponse:
 )
 async def clear_conversation(conversation_id: str, _: None = Depends(_verify_api_key)) -> None:
     from ai_data_agent.memory.conversation_memory import get_memory
+    from ai_data_agent.memory.work_memory import get_work_memory
     get_memory().clear(conversation_id)
+    get_work_memory().clear(conversation_id)
     logger.info("api.conversation.cleared", conversation_id=conversation_id)
