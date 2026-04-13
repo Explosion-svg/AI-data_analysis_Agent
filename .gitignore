@@ -17,6 +17,12 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Test
+
+test/
+
+
+
 # Build artifacts
 build/
 dist/
@@ -45,4 +51,10 @@ logs/
 
 # Project-local caches
 .cache/
+
+# Other
+
+*.md
+
+!README.md
 
