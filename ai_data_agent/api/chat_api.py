@@ -19,6 +19,7 @@ api/chat_api.py — HTTP 入口层（FastAPI Router）
 """
 from __future__ import annotations
 
+import hmac
 import uuid
 from typing import Any
 
@@ -114,8 +115,8 @@ def _verify_api_key(
       - 已配置但请求未携带 token 或 token 错误 → 返回 401
 
     安全说明：
-      当前使用明文字符串比较。生产环境建议改为 hmac.compare_digest() 防止
-      时序攻击（timing attack），并考虑换成 JWT 支持细粒度权限控制。
+      使用 hmac.compare_digest() 做常数时间比较（P0-4），
+      避免时序攻击（timing attack）泄露密钥信息。
 
     Args:
         credentials: FastAPI 自动从 Authorization: Bearer <token> 头中提取的凭证对象
@@ -123,7 +124,9 @@ def _verify_api_key(
     if not settings.api_key:
         # 未配置 API Key，允许所有请求通过（适合内网部署）
         return
-    if credentials is None or credentials.credentials != settings.api_key:
+    if credentials is None or not hmac.compare_digest(
+        credentials.credentials, settings.api_key
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key.",
@@ -317,6 +320,7 @@ async def health() -> HealthResponse:
 @router.delete(
     "/conversations/{conversation_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     summary="清除指定会话历史",
 )
 async def clear_conversation(

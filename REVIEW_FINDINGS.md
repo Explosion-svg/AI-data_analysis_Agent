@@ -8,54 +8,59 @@
 
 ## P0 安全（最优先）
 
-- [ ] **P0-1 Python 沙箱可逃逸至宿主机 RCE**【实测】
+- [x] **P0-1 Python 沙箱可逃逸至宿主机 RCE**【实测】
   - 位置：`ai_data_agent/tools/python_tool.py:62-233`
   - 4 条逃逸路径均已复现：① `io` 在白名单里，`io.open` 就是 `builtins.open`（任意读写文件）；② 沙箱注入的真实 `pd`/`np` 模块对象，经 `pd.__dict__['__builtins__']['__import__']` 取回不受限解释器；③ `().__class__.__base__.__subclasses__()` 遍历拿到 `subprocess`（实测执行了系统命令并拿到回显）；④ 白名单含 `getattr`/`setattr`/`type`/`vars`，纯内省即可绕。
   - 结合 `/chat` 默认无鉴权（`config.py:73`，`chat_api.py:123`）+ RAG 文档注入通道，一条消息即可读走 `.env` 里的 API 密钥。
   - 修法：执行移出进程——一次性子进程/容器（无网络、只读 FS、rlimit/cgroup 限制），namespace 白名单无法修复此类逃逸。
+  - 处理：`python_tool.py` 重构为一次性子进程执行（`asyncio.create_subprocess_exec` + JSON stdin/stdout 通道），主防线为进程隔离 + 敏感 env 过滤 + POSIX rlimit + 输出上限；白名单仅作纵深防御（移除 `io`）。4 条逃逸路径实测均无法触及宿主（密钥不泄入沙盒、宿主 env 不受影响）。
 
-- [ ] **P0-2 沙箱超时永远不会触发**【实测，两个代理独立确认】
+- [x] **P0-2 沙箱超时永远不会触发**【实测，两个代理独立确认】
   - 位置：`ai_data_agent/tools/python_tool.py:229` + `ai_data_agent/reliability/timeout.py:101`
   - `exec()` 同步阻塞事件循环，`asyncio.wait_for` 的定时器没有运行机会。实测 3 秒死循环在 1 秒超时设置下正常完成，无 `TimeoutError`。一个 `while True: pass` 请求冻结整个服务（所有请求、健康检查、指标全部停摆）。无内存上限（`[0]*10**10` 同样致命）。
   - 修法：进程隔离 + 硬 kill-on-timeout（与 P0-1 一并解决）；`asyncio.to_thread` 不够（线程无法强杀）。
+  - 处理：子进程 + `wait_for(communicate())` 超时后 `terminate/kill` 硬杀；实测 1s 死循环 1.05s 被杀，事件循环全程保持活跃。
 
-- [ ] **P0-3 Demo 里 `eval()` 任意代码执行**
+- [x] **P0-3 Demo 里 `eval()` 任意代码执行**
   - 位置：`Demo/mcp_server.py:8-11`
   - MCP 工具直接 `eval(expression)`，任何连接到 stdio server 的客户端可执行任意代码。属于复制粘贴陷阱。
   - 修法：删除，或换 `ast.literal_eval` / 安全表达式求值器。
+  - 处理：替换为 AST 白名单求值器（仅数字字面量 + 四则运算），`__import__`/`open`/函数调用全部拒绝。
 
-- [ ] **P0-4 `/chat` 默认无鉴权**
+- [x] **P0-4 `/chat` 默认无鉴权**
   - 位置：`ai_data_agent/config/config.py:73`、`ai_data_agent/api/chat_api.py:123`
   - `api_key` 默认 `None` 时跳过鉴权，与 P0-1 组合即远程 RCE。
   - 修法：生产默认要求鉴权；API key 比较改用 `hmac.compare_digest`（`chat_api.py:126`，当前是非常数时间比较）。
+  - 处理：config 增加 prod 强制鉴权校验（`env=prod` 且无 `api_key` 拒绝启动）；`chat_api.py` 改用 `hmac.compare_digest`。
 
 ---
 
 ## P1 仓库状态（GitHub 远端当前是坏的）
 
-- [ ] **P1-1 CI / Dockerfile / 12 个核心模块从未推送到 GitHub**
+- [x] **P1-1 CI / Dockerfile / 12 个核心模块从未推送到 GitHub**
   - untracked：`.github/workflows/ci.yml`、`Dockerfile`、`.dockerignore`、`ai_data_agent/reliability/concurrency.py`、`ai_data_agent/memory/{factory,interfaces,redis_cache_memory,redis_conversation_memory,redis_work_memory}.py`、`ai_data_agent/orchestration/langgraph_agent_loop.py`、`ai_data_agent/context/request_context.py`、`run_load_test.py`
   - 后果：远端无 CI；`.env.example` 默认 `MEMORY_BACKEND=redis`，但 Redis 后端文件远端不存在——按默认配置启动直接 import 报错。
   - 修法：补 `git add` 后提交推送。
 
-- [ ] **P1-2 本地领先远端约 8000 行未提交**（96 文件，+7949/−1500）
+- [x] **P1-2 本地领先远端约 8000 行未提交**（96 文件，+7949/−1500）
 
-- [ ] **P1-3 80 个 `.pyc` + `.idea/` 已推送到 GitHub**
+- [x] **P1-3 80 个 `.pyc` + `.idea/` 已推送到 GitHub**
   - 修法：`git rm -r --cached` 清理 pycache 与 `.idea/`（`.gitignore` 已有规则但文件已被跟踪）。
 
-- [ ] **P1-4 git index 里有 3 个幽灵空文件**
+- [x] **P1-4 git index 里有 3 个幽灵空文件**
   - `Demo/__init__/__init__.py`、`Demo/demo/__init__.py`、`ai_data_agent/orchestration/langgraph_agentloop.py` 呈 AD 状态（暂存后磁盘已删），直接 commit 会提交已删除的路径。
   - 修法：`git restore --staged` 清理。
 
-- [ ] **P1-5 `.gitignore` 的 `*.md` 全局忽略（仅 README 例外）**
+- [x] **P1-5 `.gitignore` 的 `*.md` 全局忽略（仅 README 例外）**
   - 陷阱：以后任何文档（本清单、CHANGELOG、架构说明）都无法提交。
   - 修法：删掉 `*.md` / `!README.md` 规则；本文件就是受害者之一。
 
-- [ ] **P1-6 依赖声明与实际 import 不符**
+- [x] **P1-6 依赖声明与实际 import 不符**
   - `langgraph`（`langgraph_agent_loop.py:66`）和 `mcp`（`Demo/` 两文件）被 import 但不在 `requirements.txt`；`anthropic` 在 requirements 里但源码零 import。
   - 修法：删 `anthropic` 或接上；`langgraph`/`mcp` 视去留决定添加或删除模块。
+  - 处理：删除死代码 `langgraph_agent_loop.py`（P4-6 决策）；requirements 移除 `anthropic`/`langgraph`、补充 `mcp`。
 
-- [ ] **P1-7 无 `.gitattributes`，CRLF/LF 警告刷屏**（Windows 开发典型问题）
+- [x] **P1-7 无 `.gitattributes`，CRLF/LF 警告刷屏**（Windows 开发典型问题）
   - 修法：加 `.gitattributes` 统一 `* text=auto eol=lf`。
 
 ---

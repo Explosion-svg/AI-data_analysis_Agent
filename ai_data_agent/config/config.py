@@ -21,7 +21,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -216,6 +216,22 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _require_auth_in_prod(self) -> "Settings":
+        """
+        生产环境强制要求配置 API Key（P0-4）。
+
+        默认 api_key=None 允许匿名访问（适合内网/本地开发），
+        但在 prod 环境下拒绝以无鉴权状态启动，防止 P0-1 沙箱逃逸
+        组合为未鉴权的远程 RCE。
+        """
+        if self.env == Env.prod and not self.api_key:
+            raise ValueError(
+                "API_KEY must be configured when env=prod. "
+                "Refusing to start an unauthenticated production service."
+            )
+        return self
 
     # ── 便捷属性 ─────────────────────────────────────────────────────────────────
 
