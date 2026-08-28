@@ -87,12 +87,38 @@ class Executor:
     数据流（跨步骤）：
       sql_query 的结果 → 注入 python_analysis/generate_chart 的 data 参数
 
-    失败处理策略：
+    失败处理策略（P3-4）：
     - 单个步骤失败（tool_result.success=False）：标记该步骤失败，
       依赖该步骤的所有后续步骤被标记为 "Skipped"
+    - 单个步骤抛异常：被 _execute_step 内部捕获，标记 step.error（不再中断整个请求）
     - 参数生成失败（LLM 调用失败）：返回空参数 {}，工具自己处理缺参情况
     - 工具不存在：立即标记步骤失败，不进入执行
+    - 兄弟协程异常：gather(return_exceptions=True) 不会让一个步骤的异常
+      取消其他步骤的执行（孤儿协程改状态问题）
     """
+
+    def __init__(self, router=None) -> None:
+        """
+        P3-5：模型路由器通过构造函数注入，而不是在内部调用全局 get_router()。
+
+        注入 router 的好处：
+        - Executor 的参数生成 LLM 调用可以接受熔断保护
+        - 测试时可以注入 MockLLM，避免打真实全局 router
+        - 不传时回退到全局单例，保持向后兼容
+
+        Args:
+            router: ModelRouter 实例（可选，默认使用全局单例）
+
+        注意：router 为空时**惰性**解析全局单例（调用时再 get_router()），
+        而不是在构造时急切解析。这样组件可以在全局 router 尚未装配时安全构造
+        （测试、独立脚本），也保留了 monkeypatch get_router 的测试方式。
+        """
+        # P3-5：经构造注入的 router 优先；None 时惰性回退全局单例
+        self._router = router
+
+    def _resolve_router(self):
+        """返回注入的 router，或惰性解析全局单例（P3-5）。"""
+        return self._router if self._router is not None else get_router()
 
     async def execute(
         self,
@@ -115,6 +141,7 @@ class Executor:
         - 依赖关系正确（不会在依赖完成前执行步骤）
         - 最大化并行度（无依赖的步骤同时执行）
         - 不会无限等待（检测死锁并退出）
+        - P3-4：单个步骤异常不会中断整个请求（gather return_exceptions）
 
         Args:
             plan: Planner 生成的执行计划
@@ -124,7 +151,7 @@ class Executor:
             填充了执行结果的 PlanStep 列表（所有步骤，包括失败和跳过的）
         """
         registry = get_registry()
-        router = get_router()
+        router = self._resolve_router()
 
         completed: dict[int, Any] = {}         # step_id → result.data（已完成步骤的数据）
         pending: dict[int, PlanStep] = {step.step: step for step in plan.steps}
@@ -156,7 +183,10 @@ class Executor:
                     )
                 break
 
-            # 并行执行所有可运行步骤（asyncio.gather 不阻塞，等待全部完成）
+            # P3-4：并行执行所有可运行步骤。
+            # _execute_step 内部已逐步骤 try/except 标记错误，gather 不会抛异常；
+            # return_exceptions=True 作为最后一道防线，确保单个步骤的意外异常
+            # 不会取消兄弟协程、不会让整个请求 500。
             await asyncio.gather(
                 *[
                     self._execute_step(
@@ -169,7 +199,8 @@ class Executor:
                         sem=sem,
                     )
                     for step in runnable
-                ]
+                ],
+                return_exceptions=True,
             )
 
             # 把刚完成的步骤从 pending 移除
@@ -228,35 +259,49 @@ class Executor:
                 tool = registry.get(step.tool)
 
                 # Step 2: LLM 生成工具参数（Code 路由 - DeepSeek 代码更强）
-                tool_params = await self._generate_params(
-                    step=step,
-                    tool_schema=tool.parameters_schema,
-                    completed=completed,
-                    plan_steps=plan_steps,
-                    schema_context=schema_context,
-                    router=router,
-                )
-                step.tool_params = tool_params  # 记录生成的参数（调试用）
+                try:
+                    tool_params = await self._generate_params(
+                        step=step,
+                        tool_schema=tool.parameters_schema,
+                        completed=completed,
+                        plan_steps=plan_steps,
+                        schema_context=schema_context,
+                        router=router,
+                    )
+                    step.tool_params = tool_params  # 记录生成的参数（调试用）
 
-                # Step 3: 注入依赖数据（python_analysis/generate_chart 需要 SQL 结果）
-                tool_params = self._inject_data(
-                    tool_name=step.tool,
-                    params=tool_params,
-                    completed=completed,
-                    plan_steps=plan_steps,
-                    depends_on=step.depends_on,
-                )
+                    # Step 3: 注入依赖数据（python_analysis/generate_chart 需要 SQL 结果）
+                    tool_params = self._inject_data(
+                        tool_name=step.tool,
+                        params=tool_params,
+                        completed=completed,
+                        plan_steps=plan_steps,
+                        depends_on=step.depends_on,
+                    )
 
-                logger.info(
-                    "executor.step_start",
-                    step=step.step,
-                    tool=step.tool,
-                    goal=step.goal[:80],
-                    params_preview=str(tool_params)[:120],
-                )
+                    logger.info(
+                        "executor.step_start",
+                        step=step.step,
+                        tool=step.tool,
+                        goal=step.goal[:80],
+                        params_preview=str(tool_params)[:120],
+                    )
 
-                # Step 4: 执行工具
-                result: ToolResult = await tool.run(**tool_params)
+                    # Step 4: 执行工具
+                    result: ToolResult = await tool.run(**tool_params)
+                except Exception as e:
+                    # P3-4：步骤执行过程中的意外异常（如参数注入失败、工具异常逃逸）
+                    # 在此标记步骤失败，而不是让异常传播到 execute() 的 gather 中断整个请求。
+                    step.error = f"Step execution failed: {e}"
+                    step.done = True
+                    logger.warning(
+                        "executor.step_exception",
+                        step=step.step,
+                        tool=step.tool,
+                        error=str(e),
+                    )
+                    return
+
                 step.result = result
                 step.done = True
 
@@ -380,8 +425,10 @@ class Executor:
         Returns:
             已完成步骤的结果摘要文本（多步之间用双换行分隔）
         """
+        # P4-7：不假设 plan_steps 已按 step 号有序——显式排序后再截断，
+        # 避免步骤乱序时 `break` 提前退出而漏掉更早的已完成步骤。
         lines = []
-        for s in all_steps:
+        for s in sorted(all_steps, key=lambda item: item.step):
             if s.step >= current_step.step:
                 break  # 只看当前步骤之前的步骤
             if s.done and s.result and s.result.success:
@@ -459,7 +506,7 @@ class Executor:
         从所有已完成步骤中找最近一个指定工具的执行结果数据。
 
         "最近"的定义：步骤编号最大（靠后执行）的成功结果。
-        使用 reversed() 从后往前遍历，第一个匹配即是最近的。
+        P4-7：不依赖 plan_steps 的列表顺序，显式按 step 号取最大者。
 
         Args:
             plan_steps: 所有步骤列表
@@ -468,15 +515,17 @@ class Executor:
         Returns:
             找到的 result.data，如果没找到则返回 None
         """
-        for step in reversed(plan_steps):
+        latest: PlanStep | None = None
+        for step in plan_steps:
             if (
                 step.tool == tool_name
                 and step.done
                 and step.result
                 and step.result.success
             ):
-                return step.result.data
-        return None
+                if latest is None or step.step > latest.step:
+                    latest = step
+        return latest.result.data if latest is not None else None
 
     @staticmethod
     def _find_latest_dependency_result(
@@ -505,8 +554,8 @@ class Executor:
         Returns:
             找到的依赖步骤的 data，如果没找到则返回 None
         """
-        # 从最近的依赖开始查找（reversed 保证优先找最近的）
-        for dep in reversed(depends_on):
+        # 从最大的依赖步骤号开始查找（"最近" = 编号最大，P4-7 不依赖列表顺序）
+        for dep in sorted(depends_on, reverse=True):
             for step in plan_steps:
                 if step.step != dep:
                     continue

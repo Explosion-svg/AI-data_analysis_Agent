@@ -28,6 +28,15 @@ from __future__ import annotations
 # ContextVar：异步安全的"协程本地存储"
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+import re
+
+# 租户/用户 ID 字符集白名单（P3-7）：
+# 仅允许字母数字、下划线、连字符。禁止冒号/斜杠等分隔符与特殊字符，
+# 防止通过 `X-Tenant-Id` 声明任意租户来冒充/越权（可冒充面）。
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# 会话 ID 长度上限（P4-7）：防止多 MB 输入进 dict key 和日志
+_MAX_CONVERSATION_ID_LEN = 256
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,24 @@ class RequestContext:
     user_id: str       # 业务用户 ID，从 X-User-Id Header 读取，未提供时使用 "anonymous"
     tenant_id: str     # 租户 ID，从 X-Tenant-Id Header 读取，未提供时使用 "public"
 
+    def __post_init__(self) -> None:
+        """
+        构造后校验身份字段（P3-7）。
+
+        只允许 `[A-Za-z0-9_-]` 字符集（长度 1~64）：
+        - 拒绝冒号/斜杠等分隔符，防止 `X-Tenant-Id` 声明任意租户冒充越权
+          （若 tenant_id 可含冒号，`"a:b"+"c"` 与 `"a"+"b:c"` 会碰撞出同一 scoped key）
+        - 拒绝换行/控制字符，防止日志注入与 dict key 污染
+
+        校验失败抛 ValueError，由 API 层转换为 422（Pydantic 校验语义一致）。
+        """
+        for field_name, value in (("tenant_id", self.tenant_id), ("user_id", self.user_id)):
+            if not isinstance(value, str) or not _IDENT_RE.match(value):
+                raise ValueError(
+                    f"Invalid {field_name}: {value!r}. "
+                    f"Allowed: letters/digits/underscore/hyphen, 1-64 chars."
+                )
+
     def scoped_conversation_id(self, conversation_id: str) -> str:
         """
         生成带租户作用域的 conversation key。
@@ -71,12 +98,21 @@ class RequestContext:
         在 memory 和 cache 中统一使用 scoped key，而不是裸 conversation_id，
         这样不需要在每个存储层单独实现租户隔离逻辑。
 
+        防碰撞保证（P3-7）：
+        - tenant_id 已限制为不含冒号的字符集，故
+          `"{t1}:{c1}" == "{t2}:{c2}"` 当且仅当 `t1==t2 and c1==c2`
+        - conversation_id 长度上限（P4-7）：拒绝多 MB 输入进 dict key 和日志
+
         Args:
             conversation_id: 原始会话 ID（通常是 UUID 字符串）
 
         Returns:
             带租户前缀的作用域键，如 "public:abc-123"
         """
+        if len(conversation_id) > _MAX_CONVERSATION_ID_LEN:
+            raise ValueError(
+                f"conversation_id exceeds {_MAX_CONVERSATION_ID_LEN} characters"
+            )
         return f"{self.tenant_id}:{conversation_id}"
 
 

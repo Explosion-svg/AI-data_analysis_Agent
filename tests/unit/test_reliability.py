@@ -28,7 +28,7 @@ from ai_data_agent.reliability.sql_guard import (
     extract_referenced_tables,
     validate_sql,
 )
-from ai_data_agent.reliability.timeout import TimeoutError, run_with_timeout
+from ai_data_agent.reliability.timeout import AsyncTimeoutError, run_with_timeout
 
 
 def test_validate_sql_allows_select() -> None:
@@ -95,8 +95,8 @@ async def test_run_with_timeout_success() -> None:
 
 @pytest.mark.asyncio
 async def test_run_with_timeout_raises_timeout_error() -> None:
-    # 超时应转换为项目自定义的 TimeoutError，而不是裸 asyncio 异常。
-    with pytest.raises(TimeoutError):
+    # 超时应转换为项目自定义的 AsyncTimeoutError，而不是裸 asyncio 异常。
+    with pytest.raises(AsyncTimeoutError):
         await run_with_timeout(asyncio.sleep(0.05), timeout=0.01, name="slow")
 
 

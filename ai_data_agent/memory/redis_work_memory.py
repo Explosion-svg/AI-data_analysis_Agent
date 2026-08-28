@@ -8,6 +8,7 @@ memory/redis_work_memory.py — Redis 工作记忆
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -66,7 +67,9 @@ class RedisWorkMemory(WorkMemory):
         )
         self._available = True
         self._last_ping = time.monotonic()
-        self._versions: dict[str, int] = {}
+        # P4-7：_versions 改为 OrderedDict 并施加 LRU 封顶，防止随会话数线性增长
+        # 的无界内存泄漏（与 RedisConversationMemory 保持一致）。
+        self._versions: OrderedDict[str, int] = OrderedDict()
 
         if startup_check:
             self._ping_on_startup()
@@ -221,6 +224,31 @@ class RedisWorkMemory(WorkMemory):
         if state is None:
             return None
         return asdict(state)
+
+    def build_prompt_context(self, conversation_id: str) -> str:
+        """
+        基于（可能来自 Redis 的）工作状态构建 prompt 上下文（P3-6）。
+
+        覆写基类：基类实现直接读本地 dict `self._store`，
+        在 Redis 后端下跨进程/重启后本地无缓存，会返回空串，
+        使"跨进程共享"承诺失效。
+        这里先通过 get_state() 从 Redis 加载（本地无缓存时），
+        再复用基类的文本组装逻辑。
+        """
+        if self.get_state(conversation_id) is None:
+            return ""
+        return super().build_prompt_context(conversation_id)
+
+    def build_conversation_bridge(self, conversation_id: str) -> dict[str, Any]:
+        """
+        基于（可能来自 Redis 的）工作状态构建会话桥接摘要（P3-6）。
+
+        与 build_prompt_context 同理：先经 get_state() 从 Redis 加载，
+        再复用基类逻辑，保证跨进程/重启后摘要不丢失。
+        """
+        if self.get_state(conversation_id) is None:
+            return {}
+        return super().build_conversation_bridge(conversation_id)
 
     def _persist_if_present(self, conversation_id: str) -> None:
         state = self._store.get(conversation_id)

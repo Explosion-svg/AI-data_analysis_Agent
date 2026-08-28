@@ -183,8 +183,10 @@ class CacheMemory(BaseCacheMemory):
         """
         # 先清理过期项，尽量为新项腾出空间（避免误淘汰有效项）
         self._evict_expired()
-        if len(self._store) >= self._max_size:
-            # LRU 淘汰：删除 OrderedDict 的第一个元素（最久未使用）
+        exists = key in self._store
+        if not exists and len(self._store) >= self._max_size:
+            # LRU 淘汰：删除 OrderedDict 的第一个元素（最久未使用）。
+            # 仅"新增 key"需要腾位；覆盖已有 key 不增加条目数，不该误驱逐无辜条目（P4-7）。
             oldest_key = next(iter(self._store))
             del self._store[oldest_key]
             logger.debug("cache.evict_lru", key=oldest_key[:16])
@@ -194,6 +196,11 @@ class CacheMemory(BaseCacheMemory):
             value=value,
             expires_at=time.monotonic() + ttl_s,
         )
+        if exists:
+            # P4-7：覆盖已有 key 时 move_to_end，保持 LRU 顺序。
+            # OrderedDict 对已有 key 赋值不会改变其位置——若不 move_to_end，
+            # 热 key 会留在 LRU 头部，容量满时被误驱逐。
+            self._store.move_to_end(key)
         logger.debug("cache.set", key=key[:16], ttl=ttl_s)
 
     def delete(self, key: str) -> None:

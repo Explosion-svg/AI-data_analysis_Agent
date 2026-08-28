@@ -164,6 +164,9 @@ class AgentLoop:
         self._breaker = breaker
         self._planner = planner
         self._executor = executor
+        # P4-7：singleflight 在飞表（cache_key → future）。
+        # 同 key 的并发请求共享一次计算，领导请求完成后兑现 future 并移除自身。
+        self._inflight: dict[str, asyncio.Future[AgentResponse]] = {}
 
     async def run(
         self,
@@ -209,38 +212,139 @@ class AgentLoop:
         )
         # 加租户前缀，防止不同租户的 conversation_id 冲突
         scoped_conversation_id = req_ctx.scoped_conversation_id(conversation_id)
+        cache_key = self._cache.make_key("agent", req_ctx.tenant_id, query, conversation_id)
 
+        # singleflight 用的 future：只有"使用缓存且未命中缓存"时才创建，
+        # 领导请求负责兑现它，后到并发的相同请求直接 await 等待其结果。
+        inflight: asyncio.Future[AgentResponse] | None = None
+        response: AgentResponse | None = None
+
+        try:
+            # ── 缓存命中路径 ───────────────────────────────────────────────────
+            if use_cache:
+                # P2-15：Redis 缓存同步读包 to_thread，避免阻塞事件循环
+                cached = await asyncio.to_thread(self._cache.get, cache_key)
+                if cached:
+                    logger.info(
+                        "agent_loop.cache_hit",
+                        request_id=req_ctx.request_id,
+                        user_id=req_ctx.user_id,
+                        tenant_id=req_ctx.tenant_id,
+                        conversation_id=conversation_id,
+                    )
+                    # P4-7：缓存命中同样记录延迟/迭代指标（此前跳过，
+                    # 导致"大部分请求命中缓存"时指标严重失真）
+                    self._record_latency_metrics(start, cached)
+                    return cached
+
+                # P4-7：singleflight——相同 cache_key 的并发请求只计算一次。
+                # 此前并发同 query 会全部 miss 缓存后各自跑完整 ReAct 循环
+                #（双跑/多跑，重复消耗 LLM 与 SQL 配额），后到者应等待先到者。
+                # await 一个已完成的 future 会立即返回（含先到者已失败、future
+                # 带异常的情况——此时同样抛出，交由 503 处理器统一处理）。
+                joined = self._inflight.get(cache_key)
+                if joined is not None:
+                    logger.info(
+                        "agent_loop.singleflight_join",
+                        request_id=req_ctx.request_id,
+                        user_id=req_ctx.user_id,
+                        tenant_id=req_ctx.tenant_id,
+                        conversation_id=conversation_id,
+                    )
+                    joined_response = await joined
+                    self._record_latency_metrics(start, joined_response)
+                    return joined_response
+
+                inflight = asyncio.get_running_loop().create_future()
+                self._inflight[cache_key] = inflight
+
+            # ── 计算路径（缓存未命中 / 不使用缓存）────────────────────────────
+            try:
+                response = await self._compute(
+                    query=query,
+                    conversation_id=conversation_id,
+                    scoped_conversation_id=scoped_conversation_id,
+                    request_context=req_ctx,
+                )
+            except ConcurrencyLimitExceeded:
+                # P2-10：并发过载不降级为 success=False 响应，原样上抛，
+                # 交由 main.py 的 503 处理器返回 503 Service Unavailable。
+                # 同时把单飞 future 置为异常，避免等待者被永久挂起。
+                if inflight is not None and not inflight.done():
+                    inflight.set_exception(
+                        ConcurrencyLimitExceeded(
+                            "agent_request", settings.concurrency_acquire_timeout_seconds
+                        )
+                    )
+                raise
+        finally:
+            # 领导请求完成（或失败/被取消）：兑现单飞 future 并注销，供等待者取用。
+            # 注意：response 只在计算路径被赋值；ConcurrencyLimitExceeded 路径
+            # 已在 except 中 set_exception，这里不会重复 set_result。
+            if inflight is not None:
+                if not inflight.done():
+                    if response is not None:
+                        inflight.set_result(response)
+                    else:
+                        # 领导请求被取消或异常终止（未产生 response）：
+                        # 必须让等待者拿到异常而非永久挂起。
+                        inflight.set_exception(
+                            RuntimeError("Singleflight leader request was cancelled")
+                        )
+                self._inflight.pop(cache_key, None)
+
+        # 记录端到端延迟（包含等待并发槽位的时间）并写入缓存
+        # 能走到这里说明没有抛 ConcurrencyLimitExceeded，response 必然已赋值
+        assert response is not None
+        self._record_latency_metrics(start, response)
+
+        # 只缓存成功结果
+        if use_cache and response.success:
+            await asyncio.to_thread(self._cache.set, cache_key, response)
+
+        return response
+
+    def _record_latency_metrics(self, start: float, response: AgentResponse) -> None:
+        """记录端到端延迟与迭代次数指标（P4-7：缓存命中路径也调用，保证指标不缺失）。"""
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        response.latency_ms = elapsed_ms
+        metrics.agent_latency.observe(elapsed_ms / 1000)
+        metrics.agent_iterations.observe(response.iterations)
+
+    async def _compute(
+        self,
+        *,
+        query: str,
+        conversation_id: str,
+        scoped_conversation_id: str,
+        request_context: RequestContext,
+    ) -> AgentResponse:
+        """
+        计算路径（占用并发槽 + 开启 span + 执行 ReAct 循环）。
+
+        从 run() 中拆出，使 singleflight 与缓存编排保持在 run() 外层，
+        而并发控制与追踪内聚在本方法内。
+
+        异常语义（与修复前一致）：
+        - ConcurrencyLimitExceeded：原样上抛（触发 503），不降级
+        - 其他异常：记录错误，返回 success=False 的 AgentResponse（不向调用方抛异常）
+        """
         async with get_limiter().limit("agent_request"):
             with span(
                 "agent_loop.run",
                 {
-                    "request_id": req_ctx.request_id,
-                    "user_id": req_ctx.user_id,
-                    "tenant_id": req_ctx.tenant_id,
+                    "request_id": request_context.request_id,
+                    "user_id": request_context.user_id,
+                    "tenant_id": request_context.tenant_id,
                     "conversation_id": conversation_id,
                 },
             ):
-                # 缓存检查（只在成功路径缓存，失败不缓存）
-                cache_key = self._cache.make_key("agent", req_ctx.tenant_id, query, conversation_id)
-                if use_cache:
-                    # P2-15：Redis 缓存同步读包 to_thread，避免阻塞事件循环
-                    cached = await asyncio.to_thread(self._cache.get, cache_key)
-                    if cached:
-                        logger.info(
-                            "agent_loop.cache_hit",
-                            request_id=req_ctx.request_id,
-                            user_id=req_ctx.user_id,
-                            tenant_id=req_ctx.tenant_id,
-                            conversation_id=conversation_id,
-                        )
-                        return cached
-
                 try:
-                    response = await self._react_loop(
+                    return await self._react_loop(
                         query=query,
                         conversation_id=conversation_id,
                         scoped_conversation_id=scoped_conversation_id,
-                        request_context=req_ctx,
+                        request_context=request_context,
                     )
                 except ConcurrencyLimitExceeded:
                     # P2-10：并发过载不降级为 success=False 响应，
@@ -248,35 +352,25 @@ class AgentLoop:
                     raise
                 except Exception as e:
                     # 失败时更新工作记忆状态（为了快照显示正确的失败状态）
-                    await asyncio.to_thread(self._work_memory.fail_run, scoped_conversation_id, str(e))
+                    await asyncio.to_thread(
+                        self._work_memory.fail_run, scoped_conversation_id, str(e)
+                    )
                     logger.error(
                         "agent_loop.failed",
-                        request_id=req_ctx.request_id,
-                        user_id=req_ctx.user_id,
-                        tenant_id=req_ctx.tenant_id,
+                        request_id=request_context.request_id,
+                        user_id=request_context.user_id,
+                        tenant_id=request_context.tenant_id,
                         error=str(e),
                         conversation_id=conversation_id,
                     )
                     metrics.agent_errors_total.labels(error_type=type(e).__name__).inc()
                     # 不向调用方抛异常，返回 success=False 的响应
-                    response = AgentResponse(
+                    return AgentResponse(
                         answer=f"I encountered an error: {e}",
                         conversation_id=conversation_id,
                         success=False,
                         error=str(e),
                     )
-
-        # 记录端到端延迟（在 limit 上下文外，包含等待并发槽位的时间）
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        response.latency_ms = elapsed_ms
-        metrics.agent_latency.observe(elapsed_ms / 1000)
-        metrics.agent_iterations.observe(response.iterations)
-
-        # 只缓存成功结果
-        if use_cache and response.success:
-            await asyncio.to_thread(self._cache.set, cache_key, response)
-
-        return response
 
     async def _react_loop(
         self,
@@ -476,8 +570,10 @@ class AgentLoop:
         )
 
         # Step 3: RAG 检索（可选，失败不影响主流程）
+        # P3-1：多路并行检索接线——用 QueryRewriter 产出的 all_queries
+        # （原始问题 + 改写问题 + 同义问法）逐路检索并去重合并，提升召回率。
         rag_docs = await self._retrieve_rag_docs(
-            query=rewrite_result.get("rewritten", query),
+            rewrite_result=rewrite_result,
             scoped_conversation_id=scoped_conversation_id,
         )
 
@@ -561,11 +657,16 @@ class AgentLoop:
     async def _retrieve_rag_docs(
         self,
         *,
-        query: str,
+        rewrite_result: dict[str, Any],
         scoped_conversation_id: str,
     ) -> list[dict[str, Any]]:
         """
-        执行一次可选的 RAG 知识库检索。
+        执行一次可选的多路 RAG 知识库检索（P3-1）。
+
+        多路检索策略（Multi-Query）：
+        - 使用 QueryRewriter 产出的 all_queries（原始问题 + 改写问题 + 同义问法）
+          逐路调用 search_documents 检索，再按文档去重合并结果。
+        - 相比单一查询，多路检索能覆盖同一意图的不同表达，显著提升召回率。
 
         为什么独立成方法？
         - RAG 是"可选增强"，不是核心流程
@@ -577,25 +678,44 @@ class AgentLoop:
         记录 finding 后返回空列表。
 
         Args:
-            query: 改写后的查询（改写版本通常比原始查询检索效果更好）
+            rewrite_result: QueryRewriter 的输出字典（含 all_queries 列表）
             scoped_conversation_id: 加租户前缀的会话 ID（用于 finding 写入）
 
         Returns:
-            检索到的文档列表（list[dict]），失败时返回空列表
+            检索到的文档列表（list[dict]，已去重合并），失败时返回空列表
         """
         if not self._registry.list_names():
             return []
 
+        # P3-1：从 rewrite_result 取多路查询；缺失时回退到原始查询单路
+        all_queries = rewrite_result.get("all_queries") or []
+        if not all_queries:
+            rewritten = rewrite_result.get("rewritten")
+            all_queries = [rewritten] if rewritten else []
+
+        # 合并多路检索结果（按 content 去重，保留最高相关度的一条）
+        merged: dict[str, dict[str, Any]] = {}
         try:
             rag_tool = self._registry.get("search_documents")
-            rag_result = await rag_tool.run(query=query)
-            if rag_result.success and rag_result.data:
+            for q in all_queries[:5]:  # 最多 5 路，控制成本
+                if not q or not str(q).strip():
+                    continue
+                rag_result = await rag_tool.run(query=str(q))
+                if rag_result.success and rag_result.data:
+                    for doc in rag_result.data:
+                        content = doc.get("content", "")
+                        if not content or content in merged:
+                            continue
+                        merged[content] = doc
+            docs = list(merged.values())
+            if docs:
                 await asyncio.to_thread(
                     self._work_memory.add_finding,
                     scoped_conversation_id,
-                    f"Retrieved {len(rag_result.data)} relevant knowledge document(s).",
+                    f"Retrieved {len(docs)} relevant knowledge document(s) "
+                    f"across {min(len(all_queries), 5)} query variant(s).",
                 )
-                return rag_result.data
+                return docs
         except Exception as e:
             logger.debug("agent_loop.rag_skip", error=str(e))
             await asyncio.to_thread(

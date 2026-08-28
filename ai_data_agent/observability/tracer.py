@@ -42,8 +42,7 @@ BatchSpanProcessor vs SimpleSpanProcessor：
 from __future__ import annotations
 
 import contextlib
-import functools
-from typing import Any, Callable, Generator
+from typing import Any, Generator
 
 from ai_data_agent.config.config import settings
 from ai_data_agent.observability.logger import get_logger
@@ -116,6 +115,33 @@ def init_tracer() -> None:
     _init_tracer()
 
 
+def shutdown_tracer() -> None:
+    """
+    关闭 tracer 并冲刷未导出的 span（P3-11）。
+
+    BatchSpanProcessor 是异步批量导出（默认约 5 秒缓冲），SIGTERM 直接退出
+    会丢失尾部 span。shutdown() 会 flush 缓冲区并把已排队 span 导出给
+    collector，随后关闭 exporter。未初始化（NoOp）时是 no-op。
+
+    幂等：多次调用安全；关闭后 _tracer 置 None，后续 span() 走 NoOp。
+    """
+    global _tracer, _trace_module
+    provider = None
+    if _trace_module is not None:
+        try:
+            provider = _trace_module.get_tracer_provider()
+        except Exception:  # noqa: BLE001 - 兜底
+            provider = None
+    if provider is not None and hasattr(provider, "shutdown"):
+        try:
+            provider.shutdown()
+            logger.info("tracer.shutdown.flushed")
+        except Exception as e:  # noqa: BLE001 - 关闭失败不阻断主流程
+            logger.warning("tracer.shutdown_failed", error=str(e))
+    _tracer = None
+    _trace_module = None
+
+
 # @contextlib.contextmanager 把一个函数变成可以用 with ...: 调用的代码块
 # 自动执行「前置操作」和「后置清理」
 # 分布式追踪（Tracing）中 yield 交出控制权，让业务代码在 span 上下文中运行
@@ -160,63 +186,6 @@ def span(name: str, attributes: dict[str, Any] | None = None) -> Generator:
         yield s
 
 
-def trace_async(name: str | None = None) -> Callable:
-    """
-    装饰器工厂：自动为异步函数创建 span，方法级追踪。
-
-    比手动在函数内部用 `with span(...)` 更简洁，适合需要追踪整个函数的场景。
-
-    使用方式::
-        @trace_async("agent_loop.run")
-        async def run(self, query: str) -> AgentResponse:
-            ...
-        # 等价于：
-        async def run(self, query: str) -> AgentResponse:
-            with span("agent_loop.run"):
-                return await _original_run(...)
-
-    span_name 优先级：
-    - 显式传入 name → 使用 name
-    - 未传入（None）→ 使用 fn.__qualname__（如 "AgentLoop.run"）
-
-    @functools.wraps(fn)：
-    - 保留原函数的 __name__、__doc__ 等属性
-    - 使装饰后的函数在日志、调试中仍显示原始函数名
-
-    Args:
-        name: span 名称（None 时使用 fn.__qualname__）
-
-    Returns:
-        装饰器函数（接受 async 函数，返回带 span 包装的 async 函数）
-    """
-    def decorator(fn: Callable) -> Callable:
-        span_name = name or fn.__qualname__
-
-        @functools.wraps(fn)
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            with span(span_name):
-                return await fn(*args, **kwargs)
-
-        return wrapper
-    return decorator
-
-
-def get_current_span() -> Any:
-    """
-    获取当前正在运行的 span（用于手动添加属性或记录事件）。
-
-    典型使用场景：
-    - 在执行过程中动态添加 span 属性（不是在创建时就知道所有属性）
-    - 在异常处理中调用 record_exception()
-
-    Returns:
-        当前 OTel Span 对象，如果追踪未初始化则返回 None
-    """
-    if _trace_module is None:
-        return None
-    return _trace_module.get_current_span()
-
-
 def record_exception(exc: Exception) -> None:
     """
     在当前 span 中记录异常信息（包含 traceback）。
@@ -226,11 +195,13 @@ def record_exception(exc: Exception) -> None:
     - 可以直接在 trace UI 中查看错误信息，无需搜索日志
     - 与 span 的时序信息关联（知道异常发生在请求的哪个阶段）
 
-    如果当前没有活跃 span（get_current_span() 返回 None）则静默忽略。
+    如果追踪未初始化或当前没有活跃 span 则静默忽略。
 
     Args:
         exc: 要记录的异常对象
     """
-    current = get_current_span()
+    if _trace_module is None:
+        return
+    current = _trace_module.get_current_span()
     if current:
         current.record_exception(exc)

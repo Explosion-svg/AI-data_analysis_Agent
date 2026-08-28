@@ -125,14 +125,16 @@ def create_app() -> FastAPI:
     )
 
     # ── CORS 中间件 ─────────────────────────────────────────────────────────────
-    # 当前配置允许所有来源，适合开发环境。
-    # 生产环境应将 allow_origins 替换为具体的前端域名列表。
+    # P4-7：CORS 完全由 settings 配置（cors_allow_origins / cors_allow_credentials
+    # / cors_allow_methods / cors_allow_headers），不再硬编码。
+    # 注意：allow_credentials=True 与 allow_origins=["*"] 是 CORS 规范禁止的组合，
+    # 配置层（config._validate_cors）会直接拒绝该组合，这里无需重复防御。
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=settings.cors_allow_origins,
+        allow_credentials=settings.cors_allow_credentials,
+        allow_methods=settings.cors_allow_methods,
+        allow_headers=settings.cors_allow_headers,
     )
 
     # ── 全局异常处理器 ──────────────────────────────────────────────────────────
@@ -215,11 +217,22 @@ if __name__ == "__main__":
         json_logs=settings.log_json,
         log_level=settings.log_level.value,
     )
+    # P4-7：uvicorn 的 reload（热重载）与多 worker 互斥——reload 开启时 workers 会被
+    # 静默忽略（始终单进程运行）。这里显式降级为单 worker 并告警，
+    # 避免"配置了 N 个 worker 却只跑单进程"的配置误导。
+    workers = settings.workers
+    if settings.debug and workers > 1:
+        workers = 1
+        logger.warning(
+            "main.reload_forces_single_worker",
+            configured_workers=settings.workers,
+            reason="uvicorn reload mode is incompatible with multiple workers",
+        )
     uvicorn.run(
         "ai_data_agent.main:app",
         host=settings.host,
         port=settings.port,
-        workers=settings.workers,
+        workers=workers,
         reload=settings.debug,          # 开发环境开启热重载
         log_config=None,                # 禁用 uvicorn 默认日志，改用 structlog
     )

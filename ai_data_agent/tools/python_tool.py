@@ -60,7 +60,7 @@ import traceback
 from typing import Any
 
 from ai_data_agent.tools.base_tool import BaseTool, ToolResult
-from ai_data_agent.reliability.timeout import TimeoutError
+from ai_data_agent.reliability.timeout import AsyncTimeoutError
 from ai_data_agent.config.config import settings
 from ai_data_agent.observability.logger import get_logger
 
@@ -117,6 +117,9 @@ from contextlib import redirect_stdout
 
 # 与宿主保持一致的配置（由宿主通过 stdin 传入）
 _MAX_OUTPUT = 1024 * 1024
+# 结果截断上限（P3-9）：DataFrame/序列最多保留的行数、dict 最多保留的键数
+_MAX_RESULT_ROWS = 1000
+_MAX_RESULT_DICT_KEYS = 200
 
 _SAFE_BUILTINS = {
     "abs", "all", "any", "bin", "bool", "chr", "dict", "dir",
@@ -152,6 +155,24 @@ def _build_globals(extra):
     globs = {"__builtins__": builtins_dict, "pd": pd, "pandas": pd, "np": np, "numpy": np}
     globs.update(extra)
     return globs
+
+
+def _cap_result(value):
+    # 结果过大时先截断再序列化，防止 stdout/内存无上限（P3-9）
+    import pandas as pd
+    if isinstance(value, pd.DataFrame):
+        if value.shape[0] > _MAX_RESULT_ROWS:
+            return value.head(_MAX_RESULT_ROWS)
+        return value
+    if isinstance(value, (list, tuple)):
+        if len(value) > _MAX_RESULT_ROWS:
+            return list(value[:_MAX_RESULT_ROWS])
+        return list(value)
+    if isinstance(value, dict):
+        if len(value) > _MAX_RESULT_DICT_KEYS:
+            return dict(list(value.items())[:_MAX_RESULT_DICT_KEYS])
+        return value
+    return value
 
 
 def _to_json_safe(value):
@@ -205,8 +226,20 @@ def main():
         out = buf.getvalue()
         if len(out) > _MAX_OUTPUT:
             out = out[:_MAX_OUTPUT] + "\n...[stdout truncated]..."
-        envelope = {"ok": True, "stdout": out, "result": _to_json_safe(globs.get("result"))}
-        sys.stdout.write(json.dumps(envelope, ensure_ascii=False, default=str))
+        result = _to_json_safe(_cap_result(globs.get("result")))
+        envelope = {"ok": True, "stdout": out, "result": result}
+        # 结果序列化后仍可能超过上限（如单条巨型字符串），兜底替换为摘要
+        serialized = json.dumps(envelope, ensure_ascii=False, default=str)
+        if len(serialized) > _MAX_OUTPUT:
+            envelope = {
+                "ok": True,
+                "stdout": out,
+                "result": None,
+                "result_truncated": True,
+                "result_preview": str(result)[:_MAX_OUTPUT],
+            }
+            serialized = json.dumps(envelope, ensure_ascii=False, default=str)
+        sys.stdout.write(serialized)
     except Exception as e:
         envelope = {
             "ok": False,
@@ -273,13 +306,13 @@ async def _execute_code(
     Args:
         code: 要执行的 Python 代码字符串
         data: 可选的数据记录列表（worker 侧转换为 df=pd.DataFrame(data)）
-        timeout: 硬超时（秒），超时杀进程并抛 TimeoutError
+        timeout: 硬超时（秒），超时杀进程并抛 AsyncTimeoutError
 
     Returns:
         (stdout_output, result_variable) 元组
 
     Raises:
-        TimeoutError: 代码执行超过 timeout 秒（子进程已被硬杀）
+        AsyncTimeoutError: 代码执行超过 timeout 秒（子进程已被硬杀）
         RuntimeError: worker 进程异常退出或返回不可解析的 envelope
     """
     payload = json.dumps(
@@ -304,11 +337,11 @@ async def _execute_code(
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(input=payload), timeout=timeout
         )
-    except (asyncio.TimeoutError, TimeoutError):
+    except (asyncio.TimeoutError, AsyncTimeoutError):
         # 硬杀：wait_for 取消的只是 communicate()，子进程可能仍在运行
         logger.warning("python_tool.timeout_kill", timeout=timeout)
         await _terminate_proc(proc)
-        raise TimeoutError("python_tool", timeout)
+        raise AsyncTimeoutError("python_tool", timeout)
 
     if proc.returncode != 0:
         stderr = stderr_bytes.decode("utf-8", errors="replace")[:2000] if stderr_bytes else ""
@@ -415,7 +448,7 @@ class PythonTool(BaseTool):
         在子进程沙盒中执行 Python 代码，返回执行结果。
 
         超时处理：
-        - TimeoutError（子进程被硬杀）→ ToolResult(success=False, error=str(e))
+        - AsyncTimeoutError（子进程被硬杀）→ ToolResult(success=False, error=str(e))
         - 其他异常（含沙盒代码错误）→ 捕获、记录日志、包含 traceback 在 error 中
 
         Args:
@@ -437,7 +470,7 @@ class PythonTool(BaseTool):
                 data=data,
                 timeout=settings.python_exec_timeout,
             )
-        except TimeoutError as e:
+        except AsyncTimeoutError as e:
             # 超时：快速失败（fail-fast），不重试（代码逻辑问题，重试没意义）
             return ToolResult(success=False, error=str(e))
         except Exception as e:

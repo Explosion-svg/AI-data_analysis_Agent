@@ -55,6 +55,27 @@ from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded, get_
 logger = get_logger(__name__)
 
 
+def _kwargs_preview(kwargs: dict[str, Any], budget: int = 200) -> str:
+    """
+    生成工具参数的紧凑日志预览（P3-9）。
+
+    不直接 `str(kwargs)[:N]`：大对象（如完整 DataFrame 行数据）会被
+    全量序列化后才切片，既浪费内存又会把行级数据记进 debug 日志。
+    这里逐值用 repr 截断到固定长度，整体再收口到 budget 字符。
+    """
+    parts: list[str] = []
+    for key, value in kwargs.items():
+        try:
+            text = repr(value)
+        except Exception:  # noqa: BLE001 - repr 失败兜底为类型名
+            text = f"<{type(value).__name__}>"
+        if len(text) > 80:
+            text = text[:77] + "..."
+        parts.append(f"{key}={text}")
+    preview = ", ".join(parts)
+    return preview[:budget]
+
+
 @dataclass
 class ToolInput:
     """
@@ -245,7 +266,8 @@ class BaseTool(ABC):
         # perf_counter 比 time.time() 精准（单调时钟，不受系统时间调整影响）
         start = time.perf_counter()
         metrics.tool_calls_total.labels(tool_name=self.name).inc()
-        logger.debug("tool.start", tool=self.name, kwargs=str(kwargs)[:200])
+        # P3-9：用有界预览而非 str(kwargs)[:200]，避免大对象全量序列化进 debug 日志
+        logger.debug("tool.start", tool=self.name, kwargs=_kwargs_preview(kwargs))
         try:
             # 获取并发槽（舱壁隔离，防止单工具拖垮系统）
             async with get_limiter().limit(self.name):

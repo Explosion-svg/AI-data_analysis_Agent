@@ -210,6 +210,29 @@ class Planner:
     - 保证 Planner 失败不会影响主流程的可用性
     """
 
+    def __init__(self, router=None) -> None:
+        """
+        P3-5：模型路由器通过构造函数注入，而不是在内部调用全局 get_router()。
+
+        注入 router 的好处：
+        - Planner 的 LLM 调用可以接受熔断保护（assembler 注入已装配的 router）
+        - 测试时可以注入 MockLLM，避免打真实全局 router
+        - 不传时回退到全局单例，保持向后兼容
+
+        Args:
+            router: ModelRouter 实例（可选，默认使用全局单例）
+
+        注意：router 为空时**惰性**解析全局单例（调用时再 get_router()），
+        而不是在构造时急切解析。这样组件可以在全局 router 尚未装配时安全构造
+        （测试、独立脚本），也保留了 monkeypatch get_router 的测试方式。
+        """
+        # P3-5：经构造注入的 router 优先；None 时惰性回退全局单例
+        self._router = router
+
+    def _resolve_router(self):
+        """返回注入的 router，或惰性解析全局单例（P3-5）。"""
+        return self._router if self._router is not None else get_router()
+
     async def plan(
         self,
         query: str,
@@ -240,7 +263,6 @@ class Planner:
             Plan 对象（失败时返回 Plan(complexity="simple") 降级计划）
         """
         tools_desc = "\n".join(f"- {t}" for t in available_tools)
-        router = get_router()
 
         messages = [
             Message(
@@ -258,7 +280,7 @@ class Planner:
 
         try:
             # 规划任务用 SIMPLE/fast model 节省成本（结构简单，不需要最强模型）
-            resp = await router.generate(
+            resp = await self._resolve_router().generate(
                 messages=messages,
                 task_type=TaskType.SIMPLE,
                 temperature=0.0,     # 规划需要确定性输出，不要随机性
@@ -266,27 +288,18 @@ class Planner:
             )
             raw = _strip_code_fence(resp.content)
             parsed = json.loads(raw)
+            # P3-3：步骤构造纳入 try 块——模型输出不合规时降级为 ReAct 兜底，
+            # 而不是让 KeyError 逃逸导致整请求 500。
+            steps = _parse_steps(parsed)
         except Exception as e:
             logger.warning("planner.failed", error=str(e))
             # 任何失败都降级为简单计划，让 AgentLoop 走 ReAct
             return Plan(complexity="simple", reasoning="planning failed, fallback to ReAct")
 
-        # 解析步骤列表，过滤掉缺少 tool 字段的无效步骤
-        steps = [
-            PlanStep(
-                step=s["step"],
-                tool=s.get("tool", ""),
-                goal=s.get("goal", s.get("description", "")),  # 兼容 "description" 字段名
-                depends_on=s.get("depends_on", []),
-            )
-            for s in parsed.get("plan", [])
-            if s.get("tool")   # 过滤掉没有 tool 的无效步骤（LLM 偶尔会生成这类步骤）
-        ]
-
         plan = Plan(
-            complexity=parsed.get("complexity", "moderate"),
-            reasoning=parsed.get("reasoning", ""),
-            needs_rag=parsed.get("needs_rag", False),
+            complexity=_as_str(parsed.get("complexity"), "moderate"),
+            reasoning=_as_str(parsed.get("reasoning"), ""),
+            needs_rag=bool(parsed.get("needs_rag", False)),
             steps=steps,
         )
 
@@ -301,6 +314,73 @@ class Planner:
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
+
+def _as_str(value: Any, default: str) -> str:
+    """
+    将任意值安全转换为字符串，非法值时返回默认值（P3-3）。
+
+    模型输出不可信，字段可能是 int/bool/None/嵌套结构。
+    统一收敛为 str，避免下游消费非字符串字段。
+
+    Args:
+        value: 待转换的值
+        default: 转换失败或非法时的默认值
+
+    Returns:
+        转换后的字符串
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value if value else default
+    return str(value)
+
+
+def _parse_steps(parsed: dict[str, Any]) -> list[PlanStep]:
+    """
+    从解析后的计划 JSON 中安全构造步骤列表（P3-3）。
+
+    防御性解析要点：
+    - 用 .get 取字段并做类型纠正，模型漏 "step" 字段时不抛 KeyError
+    - 过滤掉缺少 tool 字段的无效步骤
+    - step 编号去重重排：重复编号或非法编号会被重新编号为 1..N，
+      避免 executor.py 中重复 step 号静默覆盖（step_id 冲突）
+    - depends_on 归一化为 int 列表，且只保留存在的步骤编号
+    - goal 兼容 "description" 字段名
+
+    Args:
+        parsed: Planner 模型输出的 JSON 字典（可能结构不完整）
+
+    Returns:
+        规范化后的 PlanStep 列表（至少为空列表）
+    """
+    raw_steps = parsed.get("plan", [])
+    if not isinstance(raw_steps, list):
+        return []
+
+    valid: list[PlanStep] = []
+    for i, s in enumerate(raw_steps, start=1):
+        if not isinstance(s, dict):
+            continue
+        tool = s.get("tool")
+        if not tool or not isinstance(tool, str):
+            continue  # 过滤掉没有 tool 的无效步骤
+
+        goal = s.get("goal", s.get("description", ""))
+        depends_raw = s.get("depends_on", [])
+        if not isinstance(depends_raw, list):
+            depends_raw = []
+
+        valid.append(
+            PlanStep(
+                step=i,  # P3-3：强制重新编号 1..N，避免重复/缺失编号
+                tool=tool,
+                goal=_as_str(goal, ""),
+                depends_on=[int(d) for d in depends_raw if isinstance(d, (int, str)) and str(d).isdigit()],
+            )
+        )
+    return valid
+
 
 def _strip_code_fence(text: str) -> str:
     """

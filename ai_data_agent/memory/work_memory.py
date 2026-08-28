@@ -37,7 +37,7 @@ memory/work_memory.py — 工作记忆（Work Memory）
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from collections import OrderedDict
 import uuid
@@ -60,7 +60,7 @@ def _utcnow() -> datetime:
     Returns:
         当前 UTC 时间
     """
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
 @dataclass

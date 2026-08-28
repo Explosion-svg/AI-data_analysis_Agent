@@ -31,16 +31,17 @@ use_cache=False：
   - 缓存会导致相同问题每次返回相同答案，无法评估真实性能
   - 评估需要每次都走完整的 Agent 处理流程
 
-独立 AgentLoop 实例：
-  每个测试用例使用 get_container().get_agent_loop() 创建新实例，
-  确保用例间状态完全隔离（不共享对话历史、工作内存等）。
+离线模式（P4-5）：
+  EvalRunner 支持通过 agent_factory 注入假 Agent（默认从容器取真实 AgentLoop）。
+  注入假 Agent 后可以不调用任何真实 LLM 就能跑通评估链路——
+  这是把评估接入 CI 的前提（真实 LLM 评估必须手动触发，不能进 CI）。
 """
 from __future__ import annotations
 
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from ai_data_agent.assembler import get_container
 from ai_data_agent.evaluation.benchmark_dataset import BenchmarkDataset, EvalCase, get_default_dataset
@@ -61,6 +62,10 @@ class EvalResult:
     - response：Agent 的完整响应（None 表示执行异常）
     - error：如果执行过程中抛出异常，记录异常信息
     - tool_hit：工具命中率评估结果（见 EvalRunner._run_case 的判断逻辑）
+    - sql_hit：SQL 准确率评估结果（case.expected_sql 提供时评估，P4-5）
+    - answer_hit：答案质量评估结果（case.expected_answer 提供时评估，P4-5）
+    - sql_evaluated：本用例是否声明了 expected_sql（决定是否计入 SQL 命中率分母）
+    - answer_evaluated：本用例是否声明了 expected_answer（决定是否计入答案命中率分母）
     - latency_ms：端到端延迟（包含等待 Semaphore 的时间）
     """
     case_id: str
@@ -68,6 +73,10 @@ class EvalResult:
     response: AgentResponse | None = None
     error: str = ""
     tool_hit: bool = False          # 是否使用了预期工具
+    sql_hit: bool = False           # 生成的 SQL 是否命中预期 SQL（归一化精确比较）
+    answer_hit: bool = False        # 答案是否命中预期答案（归一化子串匹配）
+    sql_evaluated: bool = False     # 是否评估了 SQL 命中
+    answer_evaluated: bool = False  # 是否评估了答案命中
     latency_ms: float = 0.0
 
 
@@ -80,6 +89,8 @@ class EvalReport:
     - total：测试用例总数
     - success：成功的用例数（response.success=True）
     - tool_hit_rate：工具命中率（tool_hit=True 的比例）
+    - sql_hit_rate：SQL 准确率（sql_hit=True 的比例，仅统计提供了 expected_sql 的用例，P4-5）
+    - answer_hit_rate：答案命中率（answer_hit=True 的比例，仅统计提供了 expected_answer 的用例，P4-5）
     - avg_latency_ms：所有用例的平均延迟（包含失败的用例）
     - avg_iterations：成功用例的平均 ReAct 迭代次数
     - results：每个用例的详细结果列表（用于逐用例分析）
@@ -87,6 +98,8 @@ class EvalReport:
     total: int = 0
     success: int = 0
     tool_hit_rate: float = 0.0
+    sql_hit_rate: float = 0.0
+    answer_hit_rate: float = 0.0
     avg_latency_ms: float = 0.0
     avg_iterations: float = 0.0
     results: list[EvalResult] = field(default_factory=list)
@@ -101,6 +114,8 @@ class EvalReport:
         ==================================================
         Success Rate   : X/N (XX.X%)
         Tool Hit Rate  : XX.X%
+        SQL Hit Rate   : XX.X% (only cases with expected_sql)
+        Answer Hit Rate: XX.X% (only cases with expected_answer)
         Avg Latency    : XXXX ms
         Avg Iterations : X.X
         ==================================================
@@ -116,6 +131,8 @@ class EvalReport:
         print(f"{'='*50}")
         print(f"Success Rate   : {self.success}/{self.total} ({self.success/max(self.total,1)*100:.1f}%)")
         print(f"Tool Hit Rate  : {self.tool_hit_rate*100:.1f}%")
+        print(f"SQL Hit Rate   : {self.sql_hit_rate*100:.1f}%")
+        print(f"Answer Hit Rate: {self.answer_hit_rate*100:.1f}%")
         print(f"Avg Latency    : {self.avg_latency_ms:.0f} ms")
         print(f"Avg Iterations : {self.avg_iterations:.1f}")
         print(f"{'='*50}\n")
@@ -139,14 +156,23 @@ class EvalRunner:
         report.print_summary()
     """
 
-    def __init__(self, concurrency: int = 3) -> None:
+    def __init__(
+        self,
+        concurrency: int = 3,
+        agent_factory: Callable[[], Any] | None = None,
+    ) -> None:
         """
         初始化评估运行器。
 
         Args:
             concurrency: 同时运行的最大测试用例数（默认 3，防止 LLM API rate limit）
+            agent_factory: AgentLoop 工厂函数（P4-5）。默认从全局容器取真实
+                AgentLoop（get_container().get_agent_loop()，是容器单例）。
+                测试/离线模式可注入假 Agent 工厂，避免打真实 LLM——
+                这是评估能进入 CI 的前提。
         """
         self._concurrency = concurrency
+        self._agent_factory = agent_factory or (lambda: get_container().get_agent_loop())
 
     async def run(
         self,
@@ -223,11 +249,14 @@ class EvalRunner:
             EvalResult：用例执行结果（包含成功/失败信息）
         """
         async with sem:
-            # 每个用例创建独立的 AgentLoop 实例，确保状态完全隔离
-            agent = get_container().get_agent_loop()
-            start = time.perf_counter()
+            # P4-5：Agent 构造移入 try 块——即使 get_agent_loop()/agent_factory()
+            # 抛出异常，也只影响当前用例（写入 error），不再中断整个评估批次。
+            # 注意：默认工厂取的是容器单例（不是"每用例独立实例"），用例间隔离
+            # 依赖独立的 conversation_id，而不是独立的 AgentLoop 实例。
             result = EvalResult(case_id=case.id, question=case.question)
             try:
+                agent = self._agent_factory()
+                start = time.perf_counter()
                 resp = await agent.run(
                     query=case.question,
                     conversation_id=conversation_id,
@@ -235,6 +264,8 @@ class EvalRunner:
                 )
                 result.response = resp
                 result.latency_ms = (time.perf_counter() - start) * 1000
+                result.sql_evaluated = bool(case.expected_sql)
+                result.answer_evaluated = bool(case.expected_answer)
 
                 # 工具命中率：实际使用的工具 ⊇ 预期工具（超集）
                 if case.expected_tools:
@@ -244,6 +275,22 @@ class EvalRunner:
                 else:
                     # 无预期工具时，用成功状态替代
                     result.tool_hit = resp.success
+
+                # SQL 准确率（P4-5）：提供 expected_sql 时评估。
+                # 从 tool_calls 中提取 sql_query 的 sql 参数，与预期做归一化精确比较。
+                if case.expected_sql:
+                    result.sql_hit = self._sql_matches(
+                        self._extract_sql(resp),
+                        case.expected_sql,
+                    )
+
+                # 答案质量（P4-5）：提供 expected_answer 时评估。
+                # 归一化后做子串包含匹配（宽松启发式，避免标点/大小写干扰）。
+                if case.expected_answer:
+                    result.answer_hit = self._answer_matches(
+                        resp.answer,
+                        case.expected_answer,
+                    )
 
             except Exception as e:
                 # 异常不传播：记录错误，保证其他用例不受影响
@@ -267,6 +314,8 @@ class EvalRunner:
         各指标计算逻辑：
         - success：response 非 None 且 response.success=True 的用例数
         - tool_hit_rate：tool_hit=True 的比例（不管是否成功，命中率独立统计）
+        - sql_hit_rate：仅统计提供了 expected_sql 的用例，sql_hit=True 的比例（P4-5）
+        - answer_hit_rate：仅统计提供了 expected_answer 的用例，answer_hit=True 的比例（P4-5）
         - avg_latency：所有用例（包含失败的）的平均延迟
         - avg_iterations：只统计有 response 的用例的平均迭代次数
           （失败用例没有 iterations 数据，不参与平均计算）
@@ -293,11 +342,57 @@ class EvalRunner:
             max(sum(1 for r in results if r.response), 1)
         )
 
+        # P4-5：SQL/答案命中率只对声明了对应预期的用例求分母，
+        # 未声明的用例（sql_evaluated/answer_evaluated=False）不稀释命中率。
+        sql_cases = [r for r in results if r.sql_evaluated]
+        answer_cases = [r for r in results if r.answer_evaluated]
+        sql_hit_rate = (
+            sum(1 for r in sql_cases if r.sql_hit) / len(sql_cases) if sql_cases else 0.0
+        )
+        answer_hit_rate = (
+            sum(1 for r in answer_cases if r.answer_hit) / len(answer_cases)
+            if answer_cases else 0.0
+        )
+
         return EvalReport(
             total=total,
             success=success,
             tool_hit_rate=tool_hits / total,
+            sql_hit_rate=sql_hit_rate,
+            answer_hit_rate=answer_hit_rate,
             avg_latency_ms=avg_latency,
             avg_iterations=avg_iters,
             results=results,
         )
+
+    # ── P4-5：SQL/答案匹配辅助函数 ──────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_sql(sql: str) -> str:
+        """SQL 归一化：小写 + 空白折叠（仅用于等价性粗比较，不做语义解析）。"""
+        return " ".join(sql.lower().split())
+
+    @staticmethod
+    def _extract_sql(resp: AgentResponse) -> str | None:
+        """从 Agent 响应的工具调用中提取第一条 sql_query 的 sql 参数。"""
+        for tc in resp.tool_calls:
+            if tc.get("tool") == "sql_query":
+                args = tc.get("args") or {}
+                sql = args.get("sql")
+                if isinstance(sql, str) and sql.strip():
+                    return sql
+        return None
+
+    @staticmethod
+    def _sql_matches(used_sql: str | None, expected_sql: str) -> bool:
+        """归一化精确比较生成的 SQL 与预期 SQL。"""
+        if not used_sql:
+            return False
+        return EvalRunner._normalize_sql(used_sql) == EvalRunner._normalize_sql(expected_sql)
+
+    @staticmethod
+    def _answer_matches(answer: str, expected_answer: str) -> bool:
+        """归一化后判断预期答案是否为实际答案的子串（宽松启发式）。"""
+        a = " ".join(answer.lower().split())
+        e = " ".join(expected_answer.lower().split())
+        return bool(e) and e in a

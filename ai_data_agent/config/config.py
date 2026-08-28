@@ -12,17 +12,24 @@ config/config.py — 全局配置管理
   print(settings.openai_api_key)
 
 环境变量映射（case_insensitive=True）：
-  DATABASE_URL=... 对应 settings.database_url
+  WAREHOUSE_URL=... 对应 settings.warehouse_url
   OPENAI_API_KEY=... 对应 settings.openai_api_key
 """
 from __future__ import annotations
 
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# 项目根目录（P3-10）：config.py 位于 <root>/ai_data_agent/config/config.py，
+# parents[0]=config、parents[1]=ai_data_agent、parents[2]=项目根。
+# 用于锚定 .env 路径，避免换启动目录（CWD）时静默丢失配置。
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Env(str, Enum):
@@ -54,7 +61,9 @@ class Settings(BaseSettings):
       4. 对所有值做类型转换和校验
     """
     model_config = SettingsConfigDict(
-        env_file=".env",                # .env 文件路径（相对于运行目录）
+        # P3-10：env_file 锚定到项目根目录，而不是相对 CWD。
+        # 原先 env_file=".env" 依赖启动目录，换目录启动会静默丢失 .env 配置。
+        env_file=str(_PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,           # 环境变量名大小写不敏感
         extra="ignore",                 # 忽略 .env 中多余的字段，避免启动失败
@@ -74,17 +83,21 @@ class Settings(BaseSettings):
     default_user_id: str = "anonymous"
     default_tenant_id: str = "public"
 
-    # ── OLTP 数据库（事务型，SQLAlchemy async）─────────────────────────────────
-    # 支持 sqlite+aiosqlite / postgresql+asyncpg / mysql+aiomysql
-    database_url: str = "postgresql+asyncpg://user:password@localhost:5432/agent"
-    db_pool_size: int = 10             # 连接池基础连接数
-    db_max_overflow: int = 20          # 超过 pool_size 后最多额外创建的连接数
-    db_echo: bool = False              # True 时打印所有 SQL（仅开发调试）
+    # ── CORS ────────────────────────────────────────────────────────────────────
+    # P4-7：CORS 由配置控制，不再硬编码在 main.py。
+    # 注意：allow_credentials=True 与 allow_origins 含 "*" 是 CORS 规范禁止的组合
+    #（浏览器会拒绝携带凭证的跨域请求，且反射任意 Origin 有安全风险），
+    # 由 _validate_cors 在配置加载时拒绝。
+    cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"])
+    cors_allow_credentials: bool = False
+    cors_allow_methods: list[str] = Field(default_factory=lambda: ["*"])
+    cors_allow_headers: list[str] = Field(default_factory=lambda: ["*"])
 
     # ── OLAP 数据仓库（分析型）──────────────────────────────────────────────────
-    # 与 OLTP 分开，避免长时间分析查询耗尽 OLTP 连接池
+    # 数据分析查询的专用数据库（SQL 工具执行 SELECT 的目标库）
     # 支持 sqlite / postgresql / clickhouse 等
-    warehouse_url: str = "postgresql+asyncpg://user:password@localhost:5432/warehouse"
+    # P3-10：默认 SQLite（与 .env.example 一致）。
+    warehouse_url: str = "sqlite+aiosqlite:///./data/warehouse.db"
 
     # ── 向量数据库（ChromaDB）──────────────────────────────────────────────────
     vector_store_type: str = "chroma"              # 当前只支持 chroma
@@ -188,7 +201,6 @@ class Settings(BaseSettings):
 
     # ── 安全设置 ─────────────────────────────────────────────────────────────────
     sql_readonly: bool = True                    # 只允许 SELECT，禁止 DDL/DML（生产必须为 True）
-    python_sandbox: bool = True                  # 在沙盒中执行 Python 代码
 
     # ── 字段验证器 ────────────────────────────────────────────────────────────────
 
@@ -219,6 +231,42 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("cors_allow_origins", "cors_allow_methods", "cors_allow_headers", mode="before")
+    @classmethod
+    def _normalize_csv_list(cls, v: object) -> object:
+        """
+        与 _normalize_sql_allowed_tables 相同的 CSV 归一化（P4-7）。
+
+        CORS 列表字段通过环境变量配置时是逗号分隔字符串：
+          CORS_ALLOW_ORIGINS="https://app.example.com,https://admin.example.com"
+          → ["https://app.example.com", "https://admin.example.com"]
+        """
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @model_validator(mode="after")
+    def _validate_cors(self) -> "Settings":
+        """
+        CORS 规范校验（P4-7）：禁止 allow_credentials=True 与通配 Origin 组合。
+
+        原因：
+        - 携带凭证（Cookie/Authorization）的跨域请求不能使用 "*" 作为允许源，
+          浏览器会直接拒绝；部分实现（如 Starlette）退化为反射任意 Origin，
+          等于允许任何网站携带用户凭证访问本服务，属于安全漏洞。
+        - 因此要么不开 credentials，要么显式列出允许的来源。
+
+        Raises:
+            ValueError: credentials 与 "*" 同时开启时拒绝启动
+        """
+        if self.cors_allow_credentials and "*" in self.cors_allow_origins:
+            raise ValueError(
+                "cors_allow_credentials=True cannot be combined with '*' in "
+                "cors_allow_origins (CORS spec forbids it). "
+                "Set explicit origins instead."
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_auth_in_prod(self) -> "Settings":

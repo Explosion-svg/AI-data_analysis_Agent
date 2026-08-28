@@ -21,7 +21,7 @@ assembler.py — 应用装配器（Composition Root）
 8层初始化顺序：
   Config（已通过 Pydantic Settings 完成）
     → Observability（日志/追踪/指标：最先初始化，后续所有层都需要日志）
-    → Infra（DB / Warehouse / VectorStore：基础设施层）
+    → Infra（Warehouse / VectorStore：基础设施层）
     → Model Gateway（LLM 路由器：需要配置才能初始化）
     → Tools（SQL / Python / Chart / Schema / RAG：需要 infra + router）
     → Context（Prompt / Query Rewriter / Schema Context：需要 tools + router）
@@ -84,7 +84,7 @@ class AppContainer:
 
     字段分组：
     - cfg: 应用配置（Settings 单例）
-    - db_engine / warehouse_engine / chroma_client: 基础设施
+    - warehouse_engine / chroma_client: 基础设施
     - router: 模型路由器
     - tool_registry: 工具注册中心
     - prompt_builder / query_rewriter / schema_builder: 上下文构建
@@ -95,7 +95,7 @@ class AppContainer:
     层级装配顺序（从底到顶）：
         Config
           → Observability（日志/追踪/指标最先初始化，方便后续层记录日志）
-          → Infra（DB / Warehouse / VectorStore）
+          → Infra（Warehouse / VectorStore）
           → Model Gateway（LLM 路由器）
           → Tools（SQL / Python / Chart / Schema / RAG）
           → Context（Prompt / Query Rewriter / Schema Context）
@@ -111,7 +111,6 @@ class AppContainer:
     # 使用 field(default=None, init=False) 表示不通过构造函数传入，由内部方法赋值。
 
     # Infra 层
-    db_engine: "AsyncEngine | None" = field(default=None, init=False)
     warehouse_engine: "AsyncEngine | None" = field(default=None, init=False)
     chroma_client: "chromadb.ClientAPI | None" = field(default=None, init=False)
 
@@ -212,14 +211,16 @@ class AppContainer:
         返回按初始化逆序（LIFO）排列的资源关闭器列表（P2-20）。
 
         顺序：Orchestration 资源最后初始化，最先关闭；
-        基础设施（DB/warehouse/chroma）最先初始化，最后关闭。
+        基础设施（warehouse/chroma）最先初始化，最后关闭。
         """
         return [
             ("llm_clients", self._close_llm_clients),
             ("redis", self._close_redis),
             ("chroma", self._close_chroma),
             ("warehouse", self._close_warehouse),
-            ("db", self._close_db),
+            # P3-11：tracer 最后关闭，flush 并导出前面各组件 close 阶段
+            # 产生的 span（BatchSpanProcessor 有约 5 秒缓冲，直接退出会丢）。
+            ("tracer", self._close_tracer),
         ]
 
     async def _cleanup_partial_startup(self) -> None:
@@ -238,12 +239,6 @@ class AppContainer:
         self._reset_singletons()
 
     # ── 组件关闭器（幂等，可安全重复调用）────────────────────────────────
-
-    async def _close_db(self) -> None:
-        """关闭 OLTP 数据库连接池（P2-20）。未初始化时是 no-op。"""
-        from ai_data_agent.infra import database
-        await database.close_db()
-        self.db_engine = None
 
     async def _close_warehouse(self) -> None:
         """关闭 OLAP 数据仓库连接池（P2-20）。未初始化时是 no-op。"""
@@ -275,12 +270,17 @@ class AppContainer:
         if self.router is not None and hasattr(self.router, "close"):
             await self.router.close()
 
+    async def _close_tracer(self) -> None:
+        """关闭并冲刷 OTel tracer（P3-11）。未初始化时是 no-op。"""
+        from ai_data_agent.observability import tracer as tracer_mod
+        tracer_mod.shutdown_tracer()
+
     def _reset_singletons(self) -> None:
         """
         重置模块级全局单例，避免热重载/重启后旧资源被引用（P2-20）。
 
         与 tests/conftest.py 的 reset_singletons fixture 保持一致。
-        database/warehouse/vector_store 的单例已由各自 close 函数重置。
+        warehouse/vector_store 的单例已由各自 close 函数重置。
         """
         from ai_data_agent.memory import cache_memory, conversation_memory, work_memory
         from ai_data_agent.model_gateway import router as router_mod
@@ -378,18 +378,15 @@ class AppContainer:
 
     async def _init_infra(self) -> None:
         """
-        Step 2：初始化基础设施层（数据库 / 数据仓库 / 向量数据库）。
+        Step 2：初始化基础设施层（数据仓库 / 向量数据库）。
 
-        三个基础设施是完全独立的，理论上可以并行初始化，
+        两个基础设施是完全独立的，理论上可以并行初始化，
         但目前保持串行是为了让日志顺序可预测、问题好排查。
 
         初始化后将引擎句柄保存到容器字段，
         方便后续 health_report() 检查各组件状态。
         """
-        from ai_data_agent.infra import database, warehouse, vector_store
-
-        await database.init_db()
-        self.db_engine = database.get_engine()
+        from ai_data_agent.infra import warehouse, vector_store
 
         await warehouse.init_warehouse()
         self.warehouse_engine = warehouse.get_warehouse_engine()
@@ -469,7 +466,9 @@ class AppContainer:
         from ai_data_agent.context.schema_context import SchemaContextBuilder
 
         self.prompt_builder = PromptBuilder()
-        self.query_rewriter = QueryRewriter()
+        # P3-5：QueryRewriter 注入已装配的 router（带熔断保护），
+        # 不再通过内部 get_router() 打全局单例。
+        self.query_rewriter = QueryRewriter(router=self.router)
         self.schema_builder = SchemaContextBuilder()
         logger.debug("assembler.context_ready")
 
@@ -530,8 +529,10 @@ class AppContainer:
         from ai_data_agent.orchestration.agent_loop import AgentLoop
         from ai_data_agent.reliability.circuit_breaker import get_breaker
 
-        self.planner = Planner()
-        self.executor = Executor()
+        # P3-5：Planner/Executor 注入已装配的 router（带熔断保护），
+        # 不再通过内部 get_router() 打全局单例。
+        self.planner = Planner(router=self.router)
+        self.executor = Executor(router=self.router)
 
         # 断言检查确保所有依赖已在前序步骤中初始化
         assert self.prompt_builder is not None
@@ -702,7 +703,6 @@ class AppContainer:
         return {
             "started": self._started,
             "infra": {
-                "db": self.db_engine is not None,
                 "warehouse": self.warehouse_engine is not None,
                 "vector_store": self.chroma_client is not None,
             },

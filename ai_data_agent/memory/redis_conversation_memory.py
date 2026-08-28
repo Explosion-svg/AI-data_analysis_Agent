@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import OrderedDict
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from ai_data_agent.config.config import settings
@@ -69,7 +70,9 @@ class RedisConversationMemory(ConversationMemory):
         )
         self._available = True
         self._last_ping = time.monotonic()
-        self._versions: dict[str, int] = {}
+        # P4-7：_versions 从普通 dict 改为 OrderedDict 并施加与本地会话存储一致的
+        # LRU 封顶，防止随会话数线性增长的无界内存泄漏。
+        self._versions: OrderedDict[str, int] = OrderedDict()
 
         if startup_check:
             self._ping_on_startup()
@@ -141,7 +144,7 @@ class RedisConversationMemory(ConversationMemory):
             return None
         try:
             state, version = self._deserialize_state(raw)
-            self._versions[conversation_id] = version
+            self._set_version(conversation_id, version)
             return state
         except Exception as e:
             logger.warning(
@@ -150,6 +153,13 @@ class RedisConversationMemory(ConversationMemory):
                 error=str(e),
             )
             return None
+
+    def _set_version(self, conversation_id: str, version: int) -> None:
+        """写入会话版本号，并维护 LRU 封顶（P4-7：防止 _versions 无界增长）。"""
+        self._versions[conversation_id] = version
+        self._versions.move_to_end(conversation_id)
+        while len(self._versions) > self._max_conversations:
+            self._versions.popitem(last=False)
 
     def _full_key(self, conversation_id: str) -> str:
         return f"{self._prefix}:{conversation_id}"
@@ -230,14 +240,18 @@ class RedisConversationMemory(ConversationMemory):
                         if current_state is None:
                             expected_version = 0
                         else:
-                            merged_state = self._merge_states(current_state, merged_state)
+                            # P4-7：合并后按预算截断 recent_turns，避免并发合并
+                            # 把窗口撑到 2 倍预算（本地 _roll 会截断，但合并路径不会）。
+                            merged_state = self._merge_states(
+                                current_state, merged_state, max_turns=self._max_turns
+                            )
                             expected_version = current_version
 
                     payload = self._serialize_state(merged_state, expected_version + 1)
                     pipe.multi()
                     pipe.set(key, payload, ex=self._ttl_seconds)
                     pipe.execute()
-                    self._versions[conversation_id] = expected_version + 1
+                    self._set_version(conversation_id, expected_version + 1)
                     self._set_state(conversation_id, merged_state)
                     return True
                 except WatchError:
@@ -262,7 +276,7 @@ class RedisConversationMemory(ConversationMemory):
             Turn(
                 role=item.get("role", ""),
                 content=item.get("content", ""),
-                timestamp=RedisConversationMemory._parse_datetime(item.get("timestamp")) or datetime.utcnow(),
+                timestamp=RedisConversationMemory._parse_datetime(item.get("timestamp")) or datetime.now(timezone.utc),
                 metadata=dict(item.get("metadata", {})),
             )
             for item in state_payload.get("recent_turns", [])
@@ -288,7 +302,12 @@ class RedisConversationMemory(ConversationMemory):
         return str(value)
 
     @staticmethod
-    def _merge_states(remote: ConversationState, local: ConversationState) -> ConversationState:
+    def _merge_states(
+        remote: ConversationState,
+        local: ConversationState,
+        *,
+        max_turns: int,
+    ) -> ConversationState:
         turns: list[Turn] = []
         seen: set[tuple[str, str, str]] = set()
         for turn in sorted(remote.recent_turns + local.recent_turns, key=lambda item: item.timestamp):
@@ -297,6 +316,23 @@ class RedisConversationMemory(ConversationMemory):
                 continue
             seen.add(key)
             turns.append(turn)
+
+        # P4-7：合并后按预算截断，防止并发合并把 recent_turns 撑到 2 倍预算。
+        # 截断规则与 ConversationMemory._roll_recent_turns_into_summary 一致——
+        # 优先保留最新的 user→assistant 完整对；从最旧端淘汰。
+        max_messages = max(2, max_turns * 2)
+        if len(turns) > max_messages:
+            idx = 0
+            while len(turns) - idx > max_messages and idx < len(turns):
+                if (
+                    idx + 1 < len(turns)
+                    and turns[idx].role == "user"
+                    and turns[idx + 1].role == "assistant"
+                ):
+                    idx += 2
+                else:
+                    idx += 1
+            turns = turns[idx:]
 
         pinned_facts: list[str] = []
         for item in remote.pinned_facts + local.pinned_facts:

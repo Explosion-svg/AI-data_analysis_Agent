@@ -22,12 +22,18 @@ context/query_rewriter.py — 查询改写器
 """
 from __future__ import annotations
 
+import re
+
 from ai_data_agent.model_gateway.router import get_router, TaskType
-from ai_data_agent.model_gateway.base_model import Message, LLMConfig
-from ai_data_agent.config.config import settings
+from ai_data_agent.model_gateway.base_model import Message
 from ai_data_agent.observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+# CJK 连续段（P4-7：用于关键词切分，避免整句中文被当成一个"关键词"）
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+# 拉丁字母/数字/下划线单词（英文、模型名、表名等）
+_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 
 # ── 提示词模板 ────────────────────────────────────────────────────────────────
 
@@ -64,6 +70,29 @@ class QueryRewriter:
       }
     """
 
+    def __init__(self, router=None) -> None:
+        """
+        P3-5：模型路由器通过构造函数注入，而不是在内部调用全局 get_router()。
+
+        注入 router 的好处：
+        - 测试时可以注入 MockLLM，避免打真实全局 router
+        - 生产环境中由 assembler 注入已装配（且带熔断保护）的 router
+        - 不传时回退到全局单例，保持向后兼容
+
+        Args:
+            router: ModelRouter 实例（可选，默认使用全局单例）
+
+        注意：router 为空时**惰性**解析全局单例（调用时再 get_router()），
+        而不是在构造时急切解析。这样组件可以在全局 router 尚未装配时安全构造
+        （测试、独立脚本、优雅启动阶段），也保留了 monkeypatch get_router 的测试方式。
+        """
+        # P3-5：经构造注入的 router 优先；None 时惰性回退全局单例
+        self._router = router
+
+    def _resolve_router(self):
+        """返回注入的 router，或惰性解析全局单例（P3-5）。"""
+        return self._router if self._router is not None else get_router()
+
     async def rewrite(self, query: str) -> dict[str, str | list[str]]:
         """
         对用户问题进行语义扩展，返回改写结果字典。
@@ -84,7 +113,7 @@ class QueryRewriter:
             query: 用户原始问题
 
         Returns:
-            字典，包含 rewritten、alternatives、keywords、all_queries 四个字段
+            字典，包含 rewritten、alternatives、keywords、all_queries、reason 五个字段
 
         Example:
             >>> result = await rewriter.rewrite("今年GMV多少")
@@ -93,35 +122,43 @@ class QueryRewriter:
         """
         import json
 
-        router = get_router()
         prompt = _REWRITE_PROMPT.format(query=query)
 
         try:
-            # 使用 fast model 降低成本和延迟，temperature=0.3 允许适当的表达多样性
-            resp = await router.generate(
+            # 使用 fast model 降低成本和延迟（P3-2：不强制指定 OpenAI 模型名，
+            # 由 router 的 SIMPLE 路由自动选择快速模型，兼容 DeepSeek/Ollama 部署）
+            resp = await self._resolve_router().generate(
                 messages=[Message(role="user", content=prompt)],
                 task_type=TaskType.SIMPLE,
-                model=settings.openai_fast_model,
                 temperature=0.3,
                 max_tokens=512,
             )
-            parsed = json.loads(resp.content)
+            raw = _strip_code_fence(resp.content)
+            parsed = json.loads(raw)
         except Exception as e:
             logger.warning("query_rewriter.failed", error=str(e))
             # 降级：直接使用原始 query，不影响主流程
             return {
                 "rewritten": query,
                 "alternatives": [],
-                "keywords": query.split()[:5],
+                # P4-7：中文查询用 CJK 2-gram 切分，不再把整句当"一个关键词"
+                "keywords": _extract_keywords(query),
                 "all_queries": [query],
+                "reason": f"query rewriting failed, using original query: {e}",
             }
 
         rewritten = parsed.get("rewritten", query)
         alternatives = parsed.get("alternatives", [])
         keywords = parsed.get("keywords", [])
+        if not isinstance(alternatives, list):
+            alternatives = []
+        if not isinstance(keywords, list):
+            keywords = []
+        if not isinstance(rewritten, str) or not rewritten:
+            rewritten = query
 
         # 合并所有查询变体：原始问题放第一位，权重最高
-        all_queries = [query, rewritten] + alternatives
+        all_queries = [query, rewritten] + [a for a in alternatives if isinstance(a, str)]
 
         # 去重保序：避免相同的 query 被多次向量化和搜索
         seen: set[str] = set()
@@ -140,7 +177,74 @@ class QueryRewriter:
         )
         return {
             "rewritten": rewritten,
-            "alternatives": alternatives,
-            "keywords": keywords,
+            "alternatives": [a for a in alternatives if isinstance(a, str)][:3],
+            "keywords": [k for k in keywords if isinstance(k, str)][:8],
             "all_queries": unique,
+            "reason": parsed.get("reasoning", ""),
         }
+
+
+def _strip_code_fence(text: str) -> str:
+    """
+    去除 LLM 可能输出的 markdown code fence（P3-1）。
+
+    LLM 即使被要求"只返回 JSON"，也经常把 JSON 包在代码块里：
+        ```json
+        {"rewritten": "..."}
+        ```
+    直接 json.loads 会因为前导 ``` 而失败，导致每次静默降级。
+
+    实现与 planner._strip_code_fence 一致（三重反引号），
+    单独维护避免模块间循环导入。
+
+    Args:
+        text: 可能包含 markdown 代码块的文本
+
+    Returns:
+        去除代码块包装后的纯文本
+    """
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # 去掉首行（```json 或 ```）
+        lines = lines[1:]
+        # 去掉末行（```）
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
+def _extract_keywords(query: str) -> list[str]:
+    """
+    从查询中提取检索关键词（P4-7 降级路径用）。
+
+    之前的实现是 `query.split()[:5]`——对中文查询（无空格）会把整句
+    当成一个"关键词"，检索时几乎无效。这里改为：
+    - 拉丁字母/数字/下划线 → 按单词提取（如 "GMV"、"orders"）
+    - 连续中文字段 → 按 2-gram（bigram）切分，这是中文检索的标准 token 化
+    - 去掉纯数字等无检索意义的项，去重保序，最多返回 8 个
+
+    Args:
+        query: 用户原始查询
+
+    Returns:
+        关键词列表（可为空）
+    """
+    keywords: list[str] = list(_WORD_RE.findall(query))
+    for cjk in _CJK_RE.findall(query):
+        if len(cjk) <= 2:
+            keywords.append(cjk)
+        else:
+            for i in range(len(cjk) - 1):
+                keywords.append(cjk[i : i + 2])
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for kw in keywords:
+        kw = kw.strip()
+        if not kw or kw in seen or kw.isdigit():
+            continue  # 去重 + 去掉纯数字
+        seen.add(kw)
+        out.append(kw)
+    return out[:8]

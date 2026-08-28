@@ -14,16 +14,23 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # P4-1：与本地开发 venv（Python 3.13.12）对齐，避免 CI 在旧解释器上放行
+          # 本地会因语法/依赖差异而失败的问题。
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compile
+      - name: Import smoke test
+        # P4-1：py_compile 只查语法，查不出缺依赖（langgraph/mcp 事故证明）。
+        # import 冒烟测试能覆盖整棵 import 树，缺依赖/改名立即暴露。
         run: |
-          python -m py_compile $(find ai_data_agent -name '*.py') run_tests.py
+          python -c "import ai_data_agent; import ai_data_agent.main; print('Import successful')"
 
       - name: Run tests
-        run: pytest
+        # P4-1：pytest.ini 已限定 testpaths=tests + python_files=test_*.py，
+        # 避免把根目录脚本（如 run_load_test.py 匹配 *_test.py）误收集。
+        run: |
+          pytest -q

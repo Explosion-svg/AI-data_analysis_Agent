@@ -91,7 +91,7 @@ class CircuitBreaker:
 
     与超时的配合：
     - circuit_breaker 不包含超时功能
-    - 超时由 reliability/timeout.py 的 run_with_timeout/with_timeout 处理
+    - 超时由 reliability/timeout.py 的 run_with_timeout 处理
     - 建议在 circuit_breaker.call() 内部的 fn 里使用超时控制
     """
 
@@ -112,8 +112,18 @@ class CircuitBreaker:
                             None 时使用 settings.circuit_breaker_recovery_timeout（默认 60.0）
         """
         self.name = name
-        self._failure_threshold = failure_threshold or settings.circuit_breaker_failure_threshold
-        self._recovery_timeout = recovery_timeout or settings.circuit_breaker_recovery_timeout
+        # P4-7：用 is not None 判断而非 `or`——`or` 会吞掉显式传入的 0
+        #（如 failure_threshold=0 想表达"任何失败立即熔断"时会被默认值覆盖）。
+        self._failure_threshold = (
+            failure_threshold
+            if failure_threshold is not None
+            else settings.circuit_breaker_failure_threshold
+        )
+        self._recovery_timeout = (
+            recovery_timeout
+            if recovery_timeout is not None
+            else settings.circuit_breaker_recovery_timeout
+        )
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._last_failure_time: float = 0.0
@@ -292,7 +302,11 @@ class CircuitBreaker:
         """
         async with self._lock:
             self._failure_count += 1
-            self._last_failure_time = time.monotonic()
+            if self._state != CircuitState.OPEN:
+                # P4-7：只在非 OPEN 状态更新恢复计时。已 OPEN 时的"迟到失败"
+                #（熔断前已发出的在飞请求）不应继续推迟 HALF_OPEN 恢复探测，
+                # 否则一次存量请求的失败会把恢复时间无限后延。
+                self._last_failure_time = time.monotonic()
             logger.warning(
                 "circuit_breaker.failure",
                 name=self.name,
@@ -310,19 +324,21 @@ class CircuitBreaker:
                     )
                     metrics.circuit_breaker_open.labels(service=self.name).set(1)
 
-    def reset(self) -> None:
+    async def reset(self) -> None:
         """
-        手动重置熔断器到初始 CLOSED 状态（运维操作）。
+        手动重置熔断器到初始 CLOSED 状态（运维/测试操作）。
 
         使用场景：
         - 运维人员确认服务已恢复，手动解除熔断（不等 recovery_timeout）
         - 单元测试在每个测试用例前重置状态（确保测试隔离）
 
-        注意：这是同步方法（不需要 await），因为它只是简单的字段赋值，
-        不需要与其他协程协调（运维操作通常是串行的）。
+        P4-7：改为异步并在锁内变更状态，避免与 _on_failure/_on_success 的
+        状态转换竞争（reset 若在状态机中间执行可能覆盖掉真实状态）。
         """
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
+        async with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._probe_inflight = False
         metrics.circuit_breaker_open.labels(service=self.name).set(0)
         logger.info("circuit_breaker.reset", name=self.name)
 

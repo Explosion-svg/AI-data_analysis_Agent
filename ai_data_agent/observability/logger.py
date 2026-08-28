@@ -54,6 +54,12 @@ from structlog.types import FilteringBoundLogger
 # 日志是否已经初始化（避免重复配置）
 _LOGGER_CONFIGURED: bool = False
 
+# 最近一次正式配置的参数（P3-11 幂等判断用）。
+# main.py 的 lifespan 与 assembler._init_observability 都会调用 configure_logging，
+# 相同参数的重复调用直接跳过，避免"二次调用无效"（cache_logger_on_first_use=True
+# 使 structlog 缓存 logger，重复 configure 不生效）造成的困惑。
+_LAST_CONFIG: tuple[bool, str] | None = None
+
 # 默认日志级别（bootstrap 阶段使用）
 _DEFAULT_LOG_LEVEL: Final[str] = "INFO"
 
@@ -143,7 +149,13 @@ def configure_logging(json_logs: bool = True, log_level: str = "INFO") -> None:
         json_logs: True 使用 JSON 格式（生产），False 使用彩色控制台（开发）
         log_level: 日志级别（"DEBUG"、"INFO"、"WARNING"、"ERROR"）
     """
-    global _LOGGER_CONFIGURED
+    global _LOGGER_CONFIGURED, _LAST_CONFIG
+    normalized_level = log_level.upper()
+    params = (bool(json_logs), normalized_level)
+    # P3-11：相同参数幂等跳过——main.py 与 assembler 都会调用本函数，
+    # 二次重复 configure 在 cache_logger_on_first_use=True 下既不生效又有误导。
+    if _LOGGER_CONFIGURED and _LAST_CONFIG == params:
+        return
     shared_processors: list = [
         structlog.contextvars.merge_contextvars,    # 合并上下文变量（request_id/conversation_id）
         structlog.stdlib.add_logger_name,           # 打印日志来自哪个 logger
@@ -168,7 +180,7 @@ def configure_logging(json_logs: bool = True, log_level: str = "INFO") -> None:
         logger_factory=structlog.stdlib.LoggerFactory(),    # 兼容标准 logging
         processors=processors,
         wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, log_level.upper(), logging.INFO)
+            getattr(logging, normalized_level, logging.INFO)
         ),
         context_class=dict,
         # logger_factory=structlog.PrintLoggerFactory(sys.stdout),
@@ -180,10 +192,11 @@ def configure_logging(json_logs: bool = True, log_level: str = "INFO") -> None:
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
-        level=getattr(logging, log_level.upper(), logging.INFO),
+        level=getattr(logging, normalized_level, logging.INFO),
         force=True,  # 强制接管全局
     )
     _LOGGER_CONFIGURED = True
+    _LAST_CONFIG = params
 
 
 def get_logger(name: str) -> FilteringBoundLogger:

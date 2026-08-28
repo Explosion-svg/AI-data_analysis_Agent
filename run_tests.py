@@ -27,37 +27,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+# P4-2：分组按目录推导，避免新增测试文件被遗漏（原 integration 组只列了 3/7
+# 个文件却报绿）。load 组指向的并非负载测试，已删除——真正的压测入口是
+# run_load_test.py（独立脚本，不属于 pytest 套件）。
 GROUPS: dict[str, list[str]] = {
     "unit": ["tests/unit"],
-    "integration": [
-        "tests/integration/test_chat_api.py",
-        "tests/integration/test_agent_loop.py",
-        "tests/integration/test_main.py",
-    ],
-    "infra": [
-        "tests/integration/test_warehouse.py",
-        "tests/integration/test_vector_store.py",
-        "tests/integration/test_assembler.py",
-    ],
+    "integration": ["tests/integration"],
     "evaluation": [
         "tests/unit/test_benchmark_dataset.py",
         "tests/integration/test_evaluation.py",
-    ],
-    "load": [
-        "tests/unit/test_orchestration.py",
-        "tests/integration/test_main.py",
     ],
     "all": ["tests"],
 }
 
 
 def print_usage() -> None:
-    print("用法: python3 run_tests.py [unit|integration|infra|evaluation|load|all] [-v]")
+    print("用法: python3 run_tests.py [unit|integration|evaluation|all] [-v]")
     print("")
     print("示例:")
     print("  python3 run_tests.py unit")
-    print("  python3 run_tests.py infra")
+    print("  python3 run_tests.py integration")
     print("  python3 run_tests.py all -v")
+    print("")
+    print("压测入口: python3 run_load_test.py --mode asgi --requests 200 --concurrency 50")
 
 
 def ensure_pytest_available() -> bool:

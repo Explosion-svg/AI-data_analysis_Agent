@@ -181,6 +181,10 @@ class OpenAIModel(BaseLLM):
                 "messages": _to_openai_messages(messages),
                 "temperature": config.temperature,
                 "max_tokens": config.max_tokens,
+                # P4-7：把 config.timeout 传给单次请求（覆盖客户端默认超时）。
+                # 此前 LLMConfig.timeout 从未传给 API 调用（死配置），
+                # 导致每请求级超时设置失效。
+                "timeout": config.timeout,
             }
             # 可选参数（None 时不传，避免 API 报 400 invalid parameter）
             if config.stop:

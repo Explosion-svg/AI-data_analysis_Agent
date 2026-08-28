@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytest
 
 from ai_data_agent.memory.cache_memory import CacheMemory
@@ -91,7 +91,8 @@ def _build_redis_work_memory() -> RedisWorkMemory:
     memory = RedisWorkMemory.__new__(RedisWorkMemory)
     # P2-18：本地读缓存使用 OrderedDict 以支持 LRU 驱逐（与生产实现一致）
     memory._store = OrderedDict()
-    memory._versions = {}
+    # P4-7：_versions 同样为 OrderedDict（生产实现支持 LRU 封顶）
+    memory._versions = OrderedDict()
     memory._max_conversations = 1000
     memory._prefix = "test:work"
     memory._ttl_seconds = 123
@@ -106,8 +107,11 @@ def _build_redis_conversation_memory() -> RedisConversationMemory:
     memory = RedisConversationMemory.__new__(RedisConversationMemory)
     # P2-18：本地读缓存使用 OrderedDict 以支持 LRU 驱逐（与生产实现一致）
     memory._store = OrderedDict()
-    memory._versions = {}
+    # P4-7：_versions 同样为 OrderedDict（生产实现支持 LRU 封顶）
+    memory._versions = OrderedDict()
     memory._max_conversations = 1000
+    # P4-7：合并路径会按 _max_turns 预算截断 recent_turns
+    memory._max_turns = 20
     memory._prefix = "test:conversation"
     memory._ttl_seconds = 456
     memory._fail_open = False
@@ -201,7 +205,7 @@ def test_cache_memory_hit_miss_ttl_and_lru() -> None:
 
 def test_redis_work_memory_merges_conflicting_updates() -> None:
     memory = _build_redis_work_memory()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     remote = WorkState(
         conversation_id="c1",
         run_id="remote",
@@ -294,7 +298,7 @@ def test_redis_conversation_memory_retries_and_merges_conflicts() -> None:
     memory._client.raise_watch_once = True
     memory._client.watch_error_type = redis_conversation_memory_module.WatchError
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     remote = ConversationState(
         recent_turns=[
             Turn(role="user", content="remote question", timestamp=now),
@@ -325,6 +329,32 @@ def test_redis_conversation_memory_retries_and_merges_conflicts() -> None:
     assert persisted.rolling_summary == "older summary with more detail"
     assert persisted.pinned_facts == ["tenant=acme", "currency=CNY"]
     assert memory._client.expiry[key] == 456
+
+
+def test_redis_conversation_memory_merge_truncates_to_budget() -> None:
+    # P4-7：并发合并后 recent_turns 必须按 _max_turns 预算截断，
+    # 否则会把窗口撑到 2 倍预算（本地 _roll 会截断，但合并路径不会）。
+    memory = _build_redis_conversation_memory()  # _max_turns=20 → 40 条消息预算
+    now = datetime.now(timezone.utc)
+    remote_turns = [
+        Turn(role="user" if i % 2 == 0 else "assistant", content=f"remote-{i}", timestamp=now + timedelta(seconds=i))
+        for i in range(60)
+    ]
+    local_turns = [
+        Turn(role="user" if i % 2 == 0 else "assistant", content=f"local-{i}", timestamp=now + timedelta(seconds=100 + i))
+        for i in range(4)
+    ]
+    remote = ConversationState(recent_turns=remote_turns, rolling_summary="s", pinned_facts=[])
+    local = ConversationState(recent_turns=local_turns, rolling_summary="s", pinned_facts=[])
+
+    merged = memory._merge_states(remote, local, max_turns=memory._max_turns)
+
+    # 64 条输入 → 截断到 40 条预算
+    assert len(merged.recent_turns) == 40
+    # 保留最新端（按时间戳排序，local 时间戳最新 → 排在末尾），最旧 24 条被淘汰
+    assert merged.recent_turns[0].content == "remote-24"
+    assert [t.content for t in merged.recent_turns[-4:]] == [t.content for t in local_turns]
+    assert merged.recent_turns[-1].content == "local-3"
 
 
 @pytest.mark.asyncio

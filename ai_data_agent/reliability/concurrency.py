@@ -151,16 +151,27 @@ class ConcurrencyLimiter:
                 "concurrency.timeout",
                 bucket=bucket,
                 timeout_seconds=timeout,
-                available=sem._value,
+                available=self.available(bucket),
             )
             raise ConcurrencyLimitExceeded(bucket, timeout) from exc
-        logger.debug("concurrency.acquire", bucket=bucket, available=sem._value)
+        logger.debug("concurrency.acquire", bucket=bucket, available=self.available(bucket))
         try:
             yield
         finally:
             # 无论 yield 内部是否抛异常，都会执行 release
             sem.release()
-            logger.debug("concurrency.release", bucket=bucket, available=sem._value)
+            logger.debug("concurrency.release", bucket=bucket, available=self.available(bucket))
+
+    def available(self, bucket: str) -> int:
+        """
+        返回指定桶当前可用的并发槽数（供日志/指标使用）。
+
+        只读查询，不影响并发语义。asyncio.Semaphore 没有公开的剩余值读取
+        接口，这里把对私有属性 `_value` 的访问收敛到唯一方法内（P4-7），
+        避免散落在各处直接触碰私有属性。
+        """
+        sem = self._semaphores.get(bucket) or self._semaphores["tool"]
+        return int(sem._value)  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 # ── 全局单例 ──────────────────────────────────────────────────────────────────
@@ -188,3 +199,19 @@ def get_limiter() -> ConcurrencyLimiter:
     if _limiter is None:
         _limiter = ConcurrencyLimiter()
     return _limiter
+
+
+def reset_limiter() -> None:
+    """
+    重置全局 ConcurrencyLimiter 单例（P4-7）。
+
+    使用场景：
+    - 测试之间：asyncio.Semaphore 绑定创建时的事件循环，跨事件循环复用
+      会报 "bound to a different event loop"。conftest 在每个测试前调用，
+      确保新测试拿到绑定当前事件循环的新信号量。
+    - 配置热更新后需要重建并发配额时。
+
+    注意：调用时应确保没有协程正在 limit() 上下文内使用旧实例。
+    """
+    global _limiter
+    _limiter = None

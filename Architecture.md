@@ -40,7 +40,6 @@ ai_data_agent/
 │   ├── retry.py
 │   ├── sql_guard.py
 |	├──	circuit_breaker.py
-|	├──	fallback.py
 │   └── timeout.py
 
 ├── observability/
@@ -54,7 +53,6 @@ ai_data_agent/
 │   └── router.py
 
 ├── infra/
-│   ├── database.py
 │   ├── warehouse.py
 │   └── vector_store.py
 
@@ -844,32 +842,6 @@ OpenAI API 挂了
 停止调用
 ```
 
-#### fallback.py
-
-例如：
-
-```
-GPT4失败
-```
-
-自动切换：
-
-```
-GPT4o
-```
-
-或：
-
-```
-RAG失败
-```
-
-返回：
-
-```
-LLM直接回答
-```
-
 ### 7.Evaluation & Observability
 
 生产级Agent必须可观测。
@@ -1066,7 +1038,6 @@ code -> deepseek
 
 ```
 infra/
-├── database.py
 ├── warehouse.py
 └── vector_store.py
 ```
@@ -1075,15 +1046,6 @@ infra/
 
 ```
 外部系统连接
-```
-
-#### database.py
-
-传统数据库：
-
-```
-Postgres
-MySQL
 ```
 
 ------

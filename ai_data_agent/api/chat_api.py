@@ -78,12 +78,6 @@ class HealthResponse(BaseModel):
     env: str        # 运行环境（dev/staging/prod）
 
 
-class ErrorResponse(BaseModel):
-    """错误响应格式，与 FastAPI 默认格式保持一致。"""
-    error: str
-    detail: str = ""
-
-
 # ── FastAPI 依赖函数（Depends）────────────────────────────────────────────────
 
 def _get_logger() -> Any:
@@ -175,9 +169,12 @@ def _build_request_context(
     "/chat",
     response_model=ChatResponse,
     responses={
-        400: {"model": ErrorResponse},
-        401: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
+        # P4-7：去掉从不产生的 400 声明（Pydantic 校验失败是 422，不是 400），
+        # 也不再给错误状态声明与 FastAPI 实际错误体不一致的 model
+        #（HTTPException 只含 detail 字段），避免 OpenAPI 文档误导客户端。
+        401: {"description": "Invalid or missing API key"},
+        422: {"description": "Request validation error (empty query, invalid tenant id, etc.)"},
+        500: {"description": "Internal server error"},
     },
     summary="与数据分析 Agent 对话",
 )

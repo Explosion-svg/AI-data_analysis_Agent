@@ -48,16 +48,20 @@ class AgentMetrics:
     """
     Agent 系统的全量指标定义（Prometheus 格式）。
 
-    所有指标通过 field(default_factory=...) 在实例化时创建，
-    而不是在类定义时创建，原因：
-    - Prometheus 在创建指标时会向全局注册表（CollectorRegistry）注册
-    - 如果在模块导入时创建，重复导入会触发 ValueError（已存在相同名称的指标）
-    - 使用 default_factory 可以延迟到 metrics = AgentMetrics() 时才创建
+    指标创建时机（P3-11 修正注释）：
+    - 字段用 field(default_factory=...) 定义：指标对象在 AgentMetrics 实例化时创建，
+      而不是在类定义（class body 执行）时创建。
+    - Prometheus 指标创建时即注册到全局注册表（CollectorRegistry），同名重复注册
+      会抛 ValueError。default_factory 让"创建即注册"的时点收敛到 `metrics =
+      AgentMetrics()`（模块底部），避免类定义/实例化时机混淆。
+    - 注意：模块底部 `metrics = AgentMetrics()` 仍在模块导入时执行，因此导入本模块
+      就会注册全部指标；测试中如需重建单例，须使用独立 CollectorRegistry 或先
+      清理已注册指标，否则会因重名注册报错。
 
     指标分组：
     - LLM 指标：token 消耗、延迟、错误
     - 工具指标：调用次数、错误次数、延迟
-    - SQL 指标：查询总数、延迟、被拦截次数、审计事件
+    - SQL 指标：查询总数、错误数、延迟、被拦截次数、审计事件
     - Agent 指标：请求总数、错误、迭代次数、端到端延迟
     - 熔断器指标：状态（开/关）
     - 缓存指标：命中/未命中次数
@@ -152,6 +156,14 @@ class AgentMetrics:
         )
     )
     """被 sql_guard 拦截的 SQL 总次数。高拦截率可能表示 LLM 生成了危险 SQL。"""
+
+    sql_errors_total: Counter = field(
+        default_factory=lambda: Counter(
+            "sql_errors_total",
+            "SQL queries that failed during execution",
+        )
+    )
+    """SQL 执行失败总次数（P3-11）。用于监控仓库层故障率，与 sql_queries_total 一起算错误率。"""
 
     sql_audit_total: Counter = field(
         default_factory=lambda: Counter(

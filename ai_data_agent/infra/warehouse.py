@@ -5,11 +5,11 @@ infra/warehouse.py — 数据仓库连接器（OLAP）
   管理 OLAP（分析型）数据库连接，提供统一的 execute(sql) → DataFrame 接口，
   以及 Schema 自省接口（列出表名、获取列信息、采样数据）。
 
-OLAP vs OLTP 的分工：
-  - 这里（OLAP）：专门处理大批量分析查询（GROUP BY、聚合、宽表扫描）
-  - database.py（OLTP）：处理事务型、行级操作
-  - 分开的核心原因：OLAP 查询可能耗时数秒甚至数十秒，
-    若共用 OLTP 连接池，会迅速耗尽连接数，影响正常事务处理
+数据库设计说明：
+  - 本模块（OLAP）是系统中唯一的数据访问层，专门处理大批量分析查询
+    （GROUP BY、聚合、宽表扫描），SQL 工具的 SELECT 全部走这里
+  - 早期曾规划 OLTP 事务库（infra/database.py），但实际零调用者，
+    已在 P4-7 删除，避免"把持 30 连接池、失败阻断启动"的死重
 
 支持的数据库类型：
   - SQLite（开发/测试，无需额外服务）
@@ -51,18 +51,22 @@ async def init_warehouse() -> None:
     """
     初始化数据仓库异步引擎并执行健康检查。
 
-    与 database.py 的 init_db() 类似，但仓库连接通常不需要 Session/ORM 支持，
-    只需要原始的 Connection 接口来执行 SQL。
+    仓库连接只需要原始的 Connection 接口来执行 SQL（无需 Session/ORM）。
 
     SQLite 不支持连接池参数，因此根据 URL 前缀分别处理。
-    pool_pre_ping=True 和 pool_recycle=3600 的作用与 database.py 中相同。
+    pool_pre_ping=True 和 pool_recycle=3600 用于防止"僵尸连接"和连接老化。
 
     Raises:
         Exception: 数据库连接失败（配置错误或服务不可用）
     """
     global _engine
     kwargs: dict[str, Any] = {"future": True}
-    if not settings.warehouse_url.startswith("sqlite"):
+    if settings.warehouse_url.startswith("sqlite"):
+        # P3-11：SQLite 默认 journal 模式为 rollback-journal，多连接并发写会报
+        # "database is locked"。busy_timeout 让连接在锁释放前等待（毫秒），
+        # 配合 WAL 模式（init 时设置一次，连接级），显著降低锁冲突。
+        kwargs.update(connect_args={"timeout": 30})
+    else:
         kwargs.update(pool_pre_ping=True, pool_recycle=3600)
     _engine = create_async_engine(settings.warehouse_url, **kwargs)
     # P2-24：引擎层强制只读（防御纵深，独立于 sql_guard 文本校验）。
@@ -70,6 +74,8 @@ async def init_warehouse() -> None:
     _enforce_readonly_on_connect(_engine)
     # 健康检查，确保连接可用
     async with _engine.connect() as conn:
+        if settings.warehouse_url.startswith("sqlite"):
+            await conn.execute(text("PRAGMA journal_mode = WAL"))
         await conn.execute(text("SELECT 1"))
     # P2-17：日志脱敏，避免数据库密码进入 JSON 日志（ELK/Loki 采集）
     logger.info(
@@ -96,6 +102,8 @@ def _enforce_readonly_on_connect(engine: AsyncEngine) -> None:
         cursor = dbapi_connection.cursor()
         try:
             if url.get_backend_name() == "sqlite":
+                # P3-11：busy_timeout 连接级等待锁释放，避免并发 "database is locked"
+                cursor.execute("PRAGMA busy_timeout = 30000")
                 cursor.execute("PRAGMA query_only = ON")
             elif url.get_backend_name() == "postgresql":
                 cursor.execute("SET default_transaction_read_only = on")
@@ -145,6 +153,7 @@ async def execute(sql: str, params: dict | None = None) -> pd.DataFrame:
     指标记录：
     - metrics.sql_latency.time()：记录 SQL 执行延迟（Summary）
     - metrics.sql_queries_total.inc()：记录总查询次数（Counter）
+    - metrics.sql_errors_total.inc()：执行失败时计数（P3-11，异常路径不再跳过）
 
     Args:
         sql: 要执行的 SQL 语句（已通过安全校验）
@@ -154,12 +163,17 @@ async def execute(sql: str, params: dict | None = None) -> pd.DataFrame:
         查询结果 DataFrame，空结果时返回空 DataFrame（列名保留）
     """
     with metrics.sql_latency.time():
-        engine = get_warehouse_engine()
-        async with engine.connect() as conn:
-            result = await conn.execute(text(sql), params or {})
-            rows = result.fetchall()
-            columns = list(result.keys())
-        df = pd.DataFrame(rows, columns=columns)
+        try:
+            engine = get_warehouse_engine()
+            async with engine.connect() as conn:
+                result = await conn.execute(text(sql), params or {})
+                rows = result.fetchall()
+                columns = list(result.keys())
+            df = pd.DataFrame(rows, columns=columns)
+        except Exception:
+            # P3-11：失败路径不再跳过指标计数，SQL 错误率 = errors / (queries + errors)
+            metrics.sql_errors_total.inc()
+            raise
     metrics.sql_queries_total.inc()
     logger.debug("warehouse.execute", sql=sql[:200], rows=len(df))
     return df

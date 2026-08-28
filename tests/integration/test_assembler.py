@@ -94,8 +94,9 @@ def test_assembler_health_report() -> None:
 
 @pytest.mark.asyncio
 async def test_assembler_shutdown_closes_all_resources_in_order() -> None:
-    # P2-20：shutdown 应关闭全部 5 类资源（LLM/Redis/Chroma/Warehouse/DB），
+    # P2-20：shutdown 应关闭全部 4 类资源（LLM/Redis/Chroma/Warehouse），
     # 且按初始化逆序（LIFO）执行，最后重置启动标志。
+    # （P4-7：OLTP database 死重模块已删除，仅剩 4 类资源。）
     container = AppContainer()
     closed: list[str] = []
 
@@ -111,21 +112,17 @@ async def test_assembler_shutdown_closes_all_resources_in_order() -> None:
     async def _close_warehouse() -> None:
         closed.append("warehouse")
 
-    async def _close_db() -> None:
-        closed.append("db")
-
     container._closers = lambda: [
         ("llm_clients", _close_llm),
         ("redis", _close_redis),
         ("chroma", _close_chroma),
         ("warehouse", _close_warehouse),
-        ("db", _close_db),
     ]
     container._started = True
 
     await container.shutdown()
 
-    assert closed == ["llm", "redis", "chroma", "warehouse", "db"]
+    assert closed == ["llm", "redis", "chroma", "warehouse"]
     assert container._started is False
 
 
@@ -145,9 +142,6 @@ async def test_assembler_startup_failure_triggers_cleanup() -> None:
     async def _clean_chroma() -> None:
         cleaned.append("chroma")
 
-    async def _clean_db() -> None:
-        cleaned.append("db")
-
     container._init_observability = _noop
     container._init_infra = _fail
     container._init_model_gateway = _noop
@@ -158,11 +152,10 @@ async def test_assembler_startup_failure_triggers_cleanup() -> None:
     container._post_startup = _noop
     container._closers = lambda: [
         ("chroma", _clean_chroma),
-        ("db", _clean_db),
     ]
 
     with pytest.raises(RuntimeError, match="boom"):
         await container.startup()
 
-    assert cleaned == ["chroma", "db"]
+    assert cleaned == ["chroma"]
     assert container._started is False
