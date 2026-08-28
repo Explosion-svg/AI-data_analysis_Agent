@@ -39,6 +39,16 @@ Thumbs.db
 .env.*
 !.env.example
 
+# Secrets and credentials (防止密钥文件误提交)
+*.pem
+*.key
+*.crt
+secrets*.json
+secrets*.yaml
+secrets*.yml
+credentials.json
+service-account*.json
+
 # Runtime data (ChromaDB 持久化目录 ./data/chroma 由此覆盖)
 data/
 logs/
@@ -54,5 +64,21 @@ logs/
 
 # Project-local caches
 .cache/
+
+# Python sandbox / eval / load-test 本地产物（子进程沙箱临时文件、评测与压测输出）
+tmp*.py
+tmp*.json
+sandbox*/
+*_sandbox/
+eval_results*/
+load_test_results*/
+benchmark_results*/
+
+# Jupyter / notebook 检查点（数据分析项目常用）
+.ipynb_checkpoints/
+
+# Claude / AI 工具会话产物
+.claude/
+CLAUDE.local.md
 
 
