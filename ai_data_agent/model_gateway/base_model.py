@@ -223,6 +223,16 @@ class BaseLLM(ABC):
             True 表示 API 可用，False 表示不可用
         """
 
+    async def aclose(self) -> None:
+        """
+        释放适配器持有的底层资源（如 httpx 连接池）。
+
+        默认实现为空操作：无资源需要释放的适配器无需覆写。
+        需要关闭底层客户端的适配器（如 AsyncOpenAI 背后的 httpx 会话）
+        必须覆写此方法，供 AppContainer.shutdown() 统一调用（P2-20）。
+        """
+        return None
+
     def _make_config(self, **overrides: Any) -> LLMConfig:
         """
         构建带 override 的默认 LLMConfig。

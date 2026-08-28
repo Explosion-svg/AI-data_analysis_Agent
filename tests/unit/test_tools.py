@@ -49,6 +49,20 @@ class ErrorTool(BaseTool):
         raise RuntimeError("boom")
 
 
+class BusyTool(BaseTool):
+    # 一个用于验证 P2-10 并发超限传播的工具。
+    @property
+    def name(self) -> str:
+        return "busy_tool"
+
+    @property
+    def description(self) -> str:
+        return "busy"
+
+    async def _run(self, **kwargs):
+        return ToolResult(success=True, text="done")
+
+
 def test_tool_registry_register_get_and_export() -> None:
     # 注册后应能通过名字获取，并导出给 OpenAI function calling 的 schema。
     registry = ToolRegistry()
@@ -65,6 +79,28 @@ async def test_base_tool_run_wraps_exceptions() -> None:
     result = await ErrorTool().run()
     assert result.success is False
     assert "boom" in result.error
+
+
+@pytest.mark.asyncio
+async def test_base_tool_run_propagates_concurrency_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P2-10：并发超限属于系统过载，应原样上抛（由 503 处理器处理），
+    # 而不是被吞成 ToolResult(success=False)。
+    from contextlib import asynccontextmanager
+
+    from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded
+
+    class FakeLimiter:
+        @asynccontextmanager
+        async def limit(self, bucket):
+            raise ConcurrencyLimitExceeded(bucket, 0.1)
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        "ai_data_agent.tools.base_tool.get_limiter", lambda: FakeLimiter()
+    )
+
+    with pytest.raises(ConcurrencyLimitExceeded):
+        await BusyTool().run()
 
 
 @pytest.mark.asyncio
@@ -86,6 +122,68 @@ async def test_sql_tool_adds_limit_and_serializes(monkeypatch: pytest.MonkeyPatc
     assert result.success is True
     assert "LIMIT 5" in captured["sql"]
     assert result.data == [{"total": 10}]
+
+
+@pytest.mark.asyncio
+async def test_sql_tool_caps_max_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P2-12：LLM 传入超配置上限的 max_rows 应被钳制到硬上限。
+    from ai_data_agent.config.config import settings
+
+    monkeypatch.setattr(settings, "sql_max_rows_cap", 5)
+    captured: dict[str, str] = {}
+
+    async def execute(sql: str):
+        captured["sql"] = sql
+        return pd.DataFrame([{"v": i} for i in range(100)])
+
+    monkeypatch.setattr("ai_data_agent.tools.sql_tool.validate_sql", lambda sql: sql)
+    monkeypatch.setattr("ai_data_agent.infra.warehouse.execute", execute)
+
+    result = await SQLTool().run(sql="SELECT v FROM metrics", max_rows=99999)
+
+    assert "LIMIT 5" in captured["sql"]   # LIMIT 注入使用封顶值
+    assert len(result.data) == 5          # 结果集不超过硬上限
+
+
+@pytest.mark.asyncio
+async def test_sql_tool_truncates_large_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P2-12：SQL 自带超大 LIMIT（绕过子串检测）时，结果集仍被后截断。
+    from ai_data_agent.config.config import settings
+
+    monkeypatch.setattr(settings, "sql_max_rows_cap", 1000)
+    captured: dict[str, str] = {}
+
+    async def execute(sql: str):
+        captured["sql"] = sql
+        return pd.DataFrame([{"v": i} for i in range(5000)])
+
+    monkeypatch.setattr("ai_data_agent.tools.sql_tool.validate_sql", lambda sql: sql)
+    monkeypatch.setattr("ai_data_agent.infra.warehouse.execute", execute)
+
+    result = await SQLTool().run(sql="SELECT v FROM metrics LIMIT 5000", max_rows=10)
+
+    assert "LIMIT 10" not in captured["sql"]  # 已有 limit 子串，不重复注入
+    assert len(result.data) == 10              # 结果集被后截断
+    assert "5000" not in result.text           # 观测文本按截断后行数描述
+
+
+@pytest.mark.asyncio
+async def test_sql_tool_truncates_observation_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P2-12：观测文本超过字符上限时被截断，防止打爆 LLM 上下文。
+    from ai_data_agent.config.config import settings
+
+    monkeypatch.setattr(settings, "sql_observation_max_chars", 100)
+
+    async def execute(sql: str):
+        return pd.DataFrame([{"v": i} for i in range(1000)])
+
+    monkeypatch.setattr("ai_data_agent.tools.sql_tool.validate_sql", lambda sql: sql)
+    monkeypatch.setattr("ai_data_agent.infra.warehouse.execute", execute)
+
+    result = await SQLTool().run(sql="SELECT v FROM metrics", max_rows=1000)
+
+    assert len(result.text) <= 100
+    assert len(result.data) == 1000
 
 
 @pytest.mark.asyncio

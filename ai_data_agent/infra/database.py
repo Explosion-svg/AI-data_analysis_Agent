@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import text
+from sqlalchemy import make_url, text
 
 from ai_data_agent.config.config import settings
 from ai_data_agent.observability.logger import get_logger
@@ -117,7 +117,11 @@ async def init_db() -> None:
     # 健康检查：确认连接可用，如果失败会在启动阶段暴露问题
     async with _engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
-    logger.info("database.ready", url=settings.database_url)
+    # P2-17：日志脱敏，避免数据库密码进入 JSON 日志（ELK/Loki 采集）
+    logger.info(
+        "database.ready",
+        url=make_url(settings.database_url).render_as_string(hide_password=True),
+    )
 
 
 async def close_db() -> None:

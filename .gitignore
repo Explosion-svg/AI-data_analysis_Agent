@@ -17,21 +17,16 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# Test
-
-test/
-
-
-
 # Build artifacts
 build/
 dist/
 *.egg-info/
 .eggs/
 
-# IDE and editor files
+# IDE, editor and AI tool local files
 .idea/
 .vscode/
+.codex
 *.swp
 *.swo
 
@@ -44,13 +39,20 @@ Thumbs.db
 .env.*
 !.env.example
 
-# Runtime data
+# Runtime data (ChromaDB 持久化目录 ./data/chroma 由此覆盖)
 data/
 logs/
 *.log
 
+# SQLite local databases (开发切 sqlite 后端时生成)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Project-local caches
 .cache/
 
-# Other
 

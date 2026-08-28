@@ -90,3 +90,79 @@ def test_assembler_health_report() -> None:
     assert report["tools"]["ready"] is True
     assert report["memory"]["conversation"] is True
     assert report["orchestration"]["agent_loop"] is True
+
+
+@pytest.mark.asyncio
+async def test_assembler_shutdown_closes_all_resources_in_order() -> None:
+    # P2-20：shutdown 应关闭全部 5 类资源（LLM/Redis/Chroma/Warehouse/DB），
+    # 且按初始化逆序（LIFO）执行，最后重置启动标志。
+    container = AppContainer()
+    closed: list[str] = []
+
+    async def _close_llm() -> None:
+        closed.append("llm")
+
+    async def _close_redis() -> None:
+        closed.append("redis")
+
+    async def _close_chroma() -> None:
+        closed.append("chroma")
+
+    async def _close_warehouse() -> None:
+        closed.append("warehouse")
+
+    async def _close_db() -> None:
+        closed.append("db")
+
+    container._closers = lambda: [
+        ("llm_clients", _close_llm),
+        ("redis", _close_redis),
+        ("chroma", _close_chroma),
+        ("warehouse", _close_warehouse),
+        ("db", _close_db),
+    ]
+    container._started = True
+
+    await container.shutdown()
+
+    assert closed == ["llm", "redis", "chroma", "warehouse", "db"]
+    assert container._started is False
+
+
+@pytest.mark.asyncio
+async def test_assembler_startup_failure_triggers_cleanup() -> None:
+    # P2-21：startup 中途失败时应无条件清理已初始化的资源，
+    # 避免 K8s CrashLoop 重试时持续累积引擎/连接句柄。
+    container = AppContainer()
+    cleaned: list[str] = []
+
+    async def _noop() -> None:
+        return None
+
+    async def _fail() -> None:
+        raise RuntimeError("boom")
+
+    async def _clean_chroma() -> None:
+        cleaned.append("chroma")
+
+    async def _clean_db() -> None:
+        cleaned.append("db")
+
+    container._init_observability = _noop
+    container._init_infra = _fail
+    container._init_model_gateway = _noop
+    container._init_tools = _noop
+    container._init_context = _noop
+    container._init_memory = _noop
+    container._init_orchestration = _noop
+    container._post_startup = _noop
+    container._closers = lambda: [
+        ("chroma", _clean_chroma),
+        ("db", _clean_db),
+    ]
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await container.startup()
+
+    assert cleaned == ["chroma", "db"]
+    assert container._started is False

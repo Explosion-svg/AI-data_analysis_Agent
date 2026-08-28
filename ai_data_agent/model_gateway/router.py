@@ -35,9 +35,11 @@ Fallback 链工作方式：
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
+
+from openai import APIConnectionError, APITimeoutError, RateLimitError
 
 from ai_data_agent.config.config import settings
 from ai_data_agent.model_gateway.base_model import BaseLLM, LLMConfig, LLMResponse, Message
@@ -47,10 +49,15 @@ from ai_data_agent.model_gateway.openai_model import (
     build_openai_model,
 )
 from ai_data_agent.observability.logger import get_logger
-from ai_data_agent.reliability.concurrency import get_limiter
+from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded, get_limiter
 from ai_data_agent.reliability.retry import async_retry
 
 logger = get_logger(__name__)
+
+# 可重试的 LLM 异常：仅供应商/传输类错误（P2-9）
+# - 本地过载（ConcurrencyLimitExceeded）不是模型故障，不重试、不 fallback
+# - APIError（如 400 Bad Request）重试无意义，直接进入 fallback 判定
+_RETRYABLE_LLM_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError)
 
 
 class TaskType(str, Enum):
@@ -228,23 +235,25 @@ class ModelRouter:
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
-    @async_retry()
-    async def _generate_with_retry(
+    @async_retry(exceptions=_RETRYABLE_LLM_ERRORS)
+    async def _call_with_limiter(
         self,
         model: BaseLLM,
         messages: list[Message],
         config: LLMConfig,
     ) -> LLMResponse:
         """
-        对单个模型调用施加统一重试策略（装饰器 @async_retry() 生效）。
+        带并发槽的 LLM 调用（重试装饰器施加于外层）。
 
-        为什么把重试放在 router 层而不是 openai_model.py 适配器层？
-        - 重试策略属于 reliability 关注点，不属于"如何调用 API"的细节
-        - 适配器层的职责是"正确翻译一次 API 调用"，不关心失败时怎么办
-        - router 层更适合统一记录重试次数、fallback 触发情况和最终失败
-
-        注意：@async_retry() 使用 settings.retry_max_attempts 等全局配置，
-        不是针对 LLM 的特殊配置。如需不同策略，可传入参数覆盖。
+        P2-9 修复点：
+        1. 重试仅针对可恢复的供应商/传输错误
+           （RateLimitError / APITimeoutError / APIConnectionError），
+           不再对任意 Exception 重试（否则本地过载也会被当成模型故障）。
+        2. 每次重试尝试都独立获取 llm 并发槽（limit 在方法内部），
+           因此指数退避的 sleep 发生在 limit("llm") 作用域之外——
+           退避等待不再白白占用并发槽，避免加剧过载。
+        3. ConcurrencyLimitExceeded 不在重试列表内，会立即向上传播，
+           由 generate() 捕获并原样抛出（不触发 fallback 扫射）。
 
         Args:
             model: 要调用的具体 LLM 适配器实例
@@ -255,9 +264,12 @@ class ModelRouter:
             LLM 响应对象
 
         Raises:
-            各种 API 异常（超过最大重试次数后重新抛出）
+            ConcurrencyLimitExceeded: 本地并发超限（不重试、不 fallback）
+            RateLimitError / APITimeoutError / APIConnectionError: 重试耗尽后上抛
+            其他异常: 直接上抛（交由 generate() 的 fallback 逻辑处理）
         """
-        return await model.generate(messages, config)
+        async with get_limiter().limit("llm"):
+            return await model.generate(messages, config)
 
     async def generate(
         self,
@@ -270,15 +282,18 @@ class ModelRouter:
 
         核心调用流程：
         1. 按 task_type 选出主模型
-        2. 通过并发限制器（limit("llm")）进入临界区
-        3. 调用 _generate_with_retry()（带重试的单模型调用）
-        4. 成功则返回；失败则记录日志，进入 Fallback 流程
-        5. Fallback：遍历注册表中的其他所有适配器，逐个尝试
-        6. 第一个成功的返回；全部失败则抛出 RuntimeError
+        2. 调用 _call_with_limiter()（带并发槽 + 限定异常重试）
+        3. 成功则返回
+        4. ConcurrencyLimitExceeded（本地过载）→ 原样上抛，不 fallback
+        5. 其他异常（供应商/传输错误）→ 进入 Fallback 链
+        6. Fallback：遍历注册表中的其他所有适配器，逐个尝试
+        7. 第一个成功的返回；全部失败则抛出 RuntimeError
 
-        并发限制的位置：
-        - 每次尝试（包括 Fallback）都在 limit("llm") 内执行
-        - 这样 Fallback 调用也受到并发上限保护，不会突破限流
+        P2-9 修复点：
+        - 本地过载不再触发全适配器 fallback 扫射（LLM 本身可能健康，
+          过载时扫射只会加剧下游压力）。
+        - fallback 仅在供应商/传输错误时触发。
+        - fallback 配置保留 top_p/stop 等全部参数（P4-7 附带修复）。
 
         config_kwargs 使用场景（透传参数）：
             router.generate(messages, TaskType.COMPLEX, tools=my_tools, tool_choice="auto")
@@ -293,16 +308,18 @@ class ModelRouter:
             LLM 响应对象
 
         Raises:
+            ConcurrencyLimitExceeded: 本地并发超限（原样上抛，供 503 处理器）
             RuntimeError: 所有适配器都失败（"All LLM adapters failed."）
         """
         model = self._select_model(task_type)
         config = self._make_config(task_type, **config_kwargs)
         try:
-            async with get_limiter().limit("llm"):
-                resp = await self._generate_with_retry(model, messages, config)
-            return resp
+            return await self._call_with_limiter(model, messages, config)
+        except ConcurrencyLimitExceeded:
+            # 本地过载：LLM 本身可能健康，直接上抛（不重试、不 fallback）
+            raise
         except Exception as e:
-            # 主模型失败，启动 Fallback 链
+            # 主模型失败（供应商/传输错误），启动 Fallback 链
             logger.warning(
                 "model_router.primary_failed",
                 adapter=model.name,
@@ -313,18 +330,16 @@ class ModelRouter:
                 if fallback is model:
                     continue  # 跳过已失败的主模型
                 try:
-                    # Fallback 使用相同的 temperature/max_tokens/tools 配置
-                    fallback_cfg = LLMConfig(
-                        model=self._get_default_model(key),
-                        temperature=config.temperature,
-                        max_tokens=config.max_tokens,
-                        timeout=config.timeout,
-                        tools=config.tools,
-                        tool_choice=config.tool_choice,
+                    # Fallback 保留 temperature/max_tokens/tools/stop/top_p 全部配置，
+                    # 仅替换为该适配器的默认模型名
+                    fallback_cfg = replace(
+                        config, model=self._get_default_model(key)
                     )
                     logger.info("model_router.fallback", to=key)
-                    async with get_limiter().limit("llm"):
-                        return await self._generate_with_retry(fallback, messages, fallback_cfg)
+                    return await self._call_with_limiter(fallback, messages, fallback_cfg)
+                except ConcurrencyLimitExceeded:
+                    # 本地过载：立即上抛，不继续扫射其他适配器
+                    raise
                 except Exception as fe:
                     logger.warning("model_router.fallback_failed", adapter=key, error=str(fe))
             # 所有 Fallback 都失败
@@ -367,6 +382,21 @@ class ModelRouter:
             适配器名称列表（如 ["openai", "deepseek"]）
         """
         return list(self._registry.keys())
+
+    async def close(self) -> None:
+        """
+        关闭所有已注册适配器的底层资源（httpx 连接池等，P2-20）。
+
+        由 AppContainer.shutdown() 在优雅关闭时调用，
+        避免 AsyncOpenAI 客户端背后的 httpx 会话泄漏。
+        逐个适配器独立 try/except，单点失败不影响其余适配器关闭。
+        """
+        for key, model in list(self._registry.items()):
+            try:
+                await model.aclose()
+            except Exception as e:  # pragma: no cover - 防御性
+                logger.warning("model_router.close_failed", adapter=key, error=str(e))
+        self._registry.clear()
 
 
 # ── 全局单例 ──────────────────────────────────────────────────────────────────

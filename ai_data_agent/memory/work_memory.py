@@ -39,8 +39,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
+from collections import OrderedDict
 import uuid
 
+from ai_data_agent.config.config import settings
 from ai_data_agent.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -191,7 +193,16 @@ class WorkMemory:
 
     def __init__(self) -> None:
         """初始化空的工作记忆存储。"""
-        self._store: dict[str, WorkState] = {}
+        # P2-18：会话 ID 维度 LRU 封顶，防止按会话数线性膨胀导致 OOM。
+        self._max_conversations = max(1, int(settings.memory_max_conversations))
+        self._store: OrderedDict[str, WorkState] = OrderedDict()
+
+    def _set_state(self, conversation_id: str, state: WorkState) -> None:
+        """写入会话状态并维护 LRU 上限（P2-18）。Redis 变体本地缓存写入也走这里。"""
+        self._store[conversation_id] = state
+        self._store.move_to_end(conversation_id)
+        while len(self._store) > self._max_conversations:
+            _, _ = self._store.popitem(last=False)
 
     # ── 生命周期管理 ───────────────────────────────────────────────────────────
 
@@ -220,7 +231,7 @@ class WorkMemory:
             run_id=uuid.uuid4().hex,
             original_query=query,
         )
-        self._store[conversation_id] = state
+        self._set_state(conversation_id, state)
         logger.debug("work_memory.run_started", conversation_id=conversation_id, run_id=state.run_id)
         return state
 

@@ -37,8 +37,11 @@ PRAGMA 例外（SQLite）：
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import sqlparse
+from sqlparse import sql as _sql
+from sqlparse import tokens as _tokens
 from sqlparse.sql import Statement
 from sqlparse.tokens import Keyword, DDL, DML
 
@@ -70,14 +73,6 @@ _INJECTION_PATTERNS = re.compile(
     r"(;\s*--|;\s*/\*|UNION\s+ALL\s+SELECT|UNION\s+SELECT|1\s*=\s*1|OR\s+1\s*=\s*1)",
     re.IGNORECASE,
 )
-
-# 表名提取正则：匹配 FROM table_name 和 JOIN table_name
-# 用于 extract_referenced_tables()，支持 schema.table 格式（如 public.users）
-_TABLE_REF_PATTERN = re.compile(
-    r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_\.]*)",
-    re.IGNORECASE,
-)
-
 
 # ── 异常类 ────────────────────────────────────────────────────────────────────
 
@@ -185,21 +180,25 @@ def validate_sql(sql: str) -> str:
 
 def extract_referenced_tables(sql: str) -> list[str]:
     """
-    用正则提取 SQL 中 FROM 和 JOIN 后面的表名。
+    用 sqlparse 语法树提取 SQL 中引用的表名（P2-13 重写）。
+
+    相比旧的正则实现，现在可以正确处理：
+    - 逗号 join 列表：`FROM allowed, secret`（旧正则只提取到 allowed，可跨租户绕过）
+    - 引号标识符归一化：`FROM "secret"` / `` FROM `secret` ``（旧正则提取为空）
+    - schema 限定名：`FROM public.users`
+    - 子查询递归：`FROM (SELECT ... FROM x)` 会提取到 x
 
     使用场景：
     1. enforce_allowed_tables() 中用于白名单校验
     2. SQLTool._audit_sql() 中记录审计日志（哪些表被访问了）
 
-    实现说明（为什么用正则而不是 sqlparse）：
-    - sqlparse 的表名提取 API 较复杂，对子查询、CTE 支持不稳定
-    - 本函数只用于安全检查，不需要 100% 精确（宁可有误报，不要漏报）
-    - 正则 _TABLE_REF_PATTERN 匹配 FROM/JOIN 后的标识符（支持 schema.table 格式）
-
-    局限性：
-    - 不处理子查询中的表名（如 FROM (SELECT ...) AS sub）
-    - 不处理 WITH CTE 中的表名
-    - 对于安全校验这些局限性是可接受的（漏掉子查询表名 = 保守拦截）
+    实现原理：
+    - 递归扫描 token 树，遇到 FROM/JOIN 关键字时，取其后紧跟的表引用 token
+      （Identifier 或 IdentifierList）
+    - IdentifierList 拆分成多个 Identifier（逗号 join 的每一张表）
+    - Identifier 内只收集点号连接的 Name/Symbol 作为表名，
+      遇到空白/AS/别名即停止（避免把别名当表名）
+    - Parenthesis（子查询/括号）递归进入，提取嵌套 FROM
 
     Args:
         sql: SQL 字符串（应已通过 validate_sql 清理）
@@ -208,14 +207,75 @@ def extract_referenced_tables(sql: str) -> list[str]:
         去重后的表名列表（保留首次出现顺序，去掉引号和反引号）
     """
     tables: list[str] = []
-    for match in _TABLE_REF_PATTERN.findall(sql):
-        table = match.strip().strip('"').strip("`")
-        if not table:
-            continue
-        # 去重（保留首次出现顺序，不用 set 是为了保持顺序）
-        if table not in tables:
-            tables.append(table)
-    return tables
+    parsed = sqlparse.parse(sql)
+    if not parsed:
+        return []
+    _walk_table_refs(parsed[0].tokens, tables)
+
+    # 去重（保留首次出现顺序）
+    seen: set[str] = set()
+    result: list[str] = []
+    for table in tables:
+        key = table.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(table)
+    return result
+
+
+def _walk_table_refs(tokens: list, tables: list[str]) -> None:
+    """
+    递归扫描 token 序列，在 FROM/JOIN 关键字后收集表引用，并深入嵌套结构。
+
+    只对 FROM/JOIN 关键字后的 token 做表引用处理；
+    其他复合 token（Where/Comparison/Parenthesis 等）继续递归，
+    以捕获子查询内部的 FROM/JOIN。
+    """
+    for i, tok in enumerate(tokens):
+        if tok.is_keyword and tok.normalized.upper() in ("FROM", "JOIN"):
+            j = i + 1
+            while j < len(tokens) and tokens[j].is_whitespace:
+                j += 1
+            if j < len(tokens):
+                _collect_identifier(tokens[j], tables)
+        elif hasattr(tok, "tokens") and tok.tokens:
+            _walk_table_refs(tok.tokens, tables)
+
+
+def _collect_identifier(node: Any, tables: list[str]) -> None:
+    """
+    从单个表引用节点提取表名（支持 Identifier / IdentifierList / Parenthesis）。
+
+    - IdentifierList：逗号 join，逐个拆分 Identifier 收集
+    - Parenthesis：括号表达式（子查询），递归寻找内部 FROM/JOIN
+    - Identifier：只收集点号连接的 Name/Symbol（含引号标识符归一化），
+      遇到空白/AS/别名即停止
+    """
+    if isinstance(node, _sql.IdentifierList):
+        for ident in node.get_identifiers():
+            _collect_identifier(ident, tables)
+        return
+    if isinstance(node, _sql.Parenthesis):
+        # 括号表达式（子查询等）：递归寻找其中的 FROM/JOIN
+        _walk_table_refs(node.tokens, tables)
+        return
+    # Identifier：只收集点号连接的 Name/Symbol，遇到空白/AS/别名即停止
+    parts: list[str] = []
+    for sub in node.tokens:
+        tt = sub.ttype
+        if tt in (_tokens.Name, _tokens.Literal.String.Symbol):
+            parts.append(sub.value)
+        elif tt is _tokens.Punctuation and sub.value == ".":
+            parts.append(".")
+        elif isinstance(sub, _sql.Parenthesis):
+            # 子查询（如 FROM (SELECT ...) AS alias）
+            _walk_table_refs(sub.tokens, tables)
+            break  # 子查询之后的 alias 不是表
+        else:
+            break  # 空白 / AS / 别名 → 表名结束
+    name = "".join(parts).strip(".").strip('"`[]')
+    if name:
+        tables.append(name)
 
 
 def enforce_allowed_tables(sql: str, allowed_tables: list[str]) -> None:

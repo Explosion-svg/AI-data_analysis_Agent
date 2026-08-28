@@ -18,7 +18,7 @@ reliability/concurrency.py — 并发限流与舱壁隔离（Bulkhead Pattern）
 Semaphore 超时（acquire timeout）：
   如果等待获取 Semaphore 超过 concurrency_acquire_timeout_seconds，
   抛出 ConcurrencyLimitExceeded 而非无限等待。
-  这防止了请求在高负载时永久阻塞，保证服务端能快速返回 429 而不是超时。
+  这防止了请求在高负载时永久阻塞，保证服务端能快速返回 503 而不是超时。
 
 与 circuit_breaker 的区别：
   - concurrency：限制"当前"并发量（入口流量控制）
@@ -49,7 +49,7 @@ class ConcurrencyLimitExceeded(RuntimeError):
 
     继承 RuntimeError 而不是 Exception：
     - 表示"系统资源不足"这类运行时错误，而不是业务逻辑错误
-    - AgentLoop 的异常处理会捕获此异常，返回 429/busy 响应
+    - AgentLoop 的异常处理会捕获此异常，返回 503/busy 响应
 
     额外属性 bucket 和 timeout_seconds 方便日志排查：
     - bucket：哪个资源桶满了（"llm"、"sql_query" 等）

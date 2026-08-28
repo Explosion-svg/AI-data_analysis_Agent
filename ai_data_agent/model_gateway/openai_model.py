@@ -338,6 +338,15 @@ class OpenAIModel(BaseLLM):
         except Exception:
             return False
 
+    async def aclose(self) -> None:
+        """
+        关闭 AsyncOpenAI 客户端及其背后的 httpx 连接池（P2-20）。
+
+        应用优雅关闭时由 ModelRouter.close() 逐适配器调用，
+        避免 httpx 会话在 SIGTERM 后残留导致端口占用或连接泄漏。
+        """
+        await self._client.close()
+
 
 # ── 工厂函数 ─────────────────────────────────────────────────────────────────
 

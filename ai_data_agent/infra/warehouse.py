@@ -32,8 +32,8 @@ import re
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import event, make_url, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
-from sqlalchemy import text
 
 from ai_data_agent.config.config import settings
 from ai_data_agent.observability.logger import get_logger
@@ -65,10 +65,42 @@ async def init_warehouse() -> None:
     if not settings.warehouse_url.startswith("sqlite"):
         kwargs.update(pool_pre_ping=True, pool_recycle=3600)
     _engine = create_async_engine(settings.warehouse_url, **kwargs)
+    # P2-24：引擎层强制只读（防御纵深，独立于 sql_guard 文本校验）。
+    # 连接级强制只读，任何新建连接都会被应用，配合连接池复用。
+    _enforce_readonly_on_connect(_engine)
     # 健康检查，确保连接可用
     async with _engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
-    logger.info("warehouse.ready", url=settings.warehouse_url)
+    # P2-17：日志脱敏，避免数据库密码进入 JSON 日志（ELK/Loki 采集）
+    logger.info(
+        "warehouse.ready",
+        url=make_url(settings.warehouse_url).render_as_string(hide_password=True),
+    )
+
+
+def _enforce_readonly_on_connect(engine: AsyncEngine) -> None:
+    """
+    为每个新建连接设置只读会话，让仓库引擎从连接层面拒绝写操作。
+
+    SQLite：PRAGMA query_only = ON（等价于只读模式，写语句直接报错）
+    PostgreSQL：default_transaction_read_only = on（事务级只读）
+
+    用 SQLAlchemy 事件而不是在 init 时执行一次的原因：
+    - PRAGMA/SET 是连接级状态，连接池复用/新建连接都需要生效
+    - 事件钩子在每次建立连接时触发，覆盖所有池化连接
+    """
+    url = make_url(settings.warehouse_url)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _apply_readonly(dbapi_connection, connection_record) -> None:  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        try:
+            if url.get_backend_name() == "sqlite":
+                cursor.execute("PRAGMA query_only = ON")
+            elif url.get_backend_name() == "postgresql":
+                cursor.execute("SET default_transaction_read_only = on")
+        finally:
+            cursor.close()
 
 
 async def close_warehouse() -> None:

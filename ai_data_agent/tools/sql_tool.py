@@ -108,6 +108,9 @@ class SQLTool(BaseTool):
                     "type": "integer",
                     "description": "Maximum number of rows to return (default: 100).",
                     "default": 100,
+                    # P2-12：JSON Schema 边界约束，避免 LLM 生成超大结果集
+                    "minimum": 1,
+                    "maximum": max(1, settings.sql_max_rows_cap),
                 },
             },
             "required": ["sql"],
@@ -150,9 +153,12 @@ class SQLTool(BaseTool):
             return ToolResult(success=False, error=f"SQL safety check failed: {e}")
 
         # Step 2: 注入 LIMIT（防止超大结果集）
+        # P2-12：Python 侧强制封顶——忽略 LLM 传入的超配置上限/非法的 max_rows，
+        # 无论 SQL 是否自带 LIMIT，结果集最终都会被后截断兜底。
+        max_rows = max(1, min(int(max_rows), max(1, settings.sql_max_rows_cap)))
         # 使用子查询包装，确保 ORDER BY ... LIMIT 的语义正确
-        if max_rows > 0 and "limit" not in safe_sql.lower():
-            safe_sql = f"SELECT * FROM ({safe_sql}) AS _q LIMIT {int(max_rows)}"
+        if "limit" not in safe_sql.lower():
+            safe_sql = f"SELECT * FROM ({safe_sql}) AS _q LIMIT {max_rows}"
 
         # Step 3: 执行查询（带超时保护）
         from ai_data_agent.infra import warehouse
@@ -167,14 +173,19 @@ class SQLTool(BaseTool):
             return ToolResult(success=False, error=f"SQL execution failed: {e}")
 
         # Step 4: 序列化输出
+        # P2-12：结果集强制封顶（SQL 自带超大 LIMIT 或绕过子串检测时的兜底）
+        if len(df) > max_rows:
+            df = df.head(max_rows)
         rows, cols = df.shape
         if rows == 0:
             text = "Query returned no rows."
         else:
-            text = (
+            full_text = (
                 f"Query returned {rows} row(s), {cols} column(s).\n"
                 f"{df.to_markdown(index=False)}"
             )
+            # P2-12：观测文本限字符数，防止大结果集把 LLM 上下文打爆
+            text = full_text[: max(1, settings.sql_observation_max_chars)]
         self._audit_sql(sql=sql, safe_sql=safe_sql, rows=rows, outcome="success")
 
         return ToolResult(

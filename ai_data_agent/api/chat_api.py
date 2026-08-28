@@ -19,6 +19,7 @@ api/chat_api.py — HTTP 入口层（FastAPI Router）
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import uuid
 from typing import Any
@@ -264,9 +265,16 @@ async def chat(
 
     # Agent 内部错误（非异常，但 success=False）转换为 HTTP 500
     if not response.success:
+        # P2-23：服务端记录完整错误，客户端只返回通用消息 + request_id，
+        # 避免内部错误原文（可能含数据库 URL/密码等敏感信息）泄露到响应体。
+        logger.error(
+            "api.chat.agent_failed",
+            request_id=request_context.request_id,
+            error=response.error,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=response.error or "Agent failed.",
+            detail=f"Agent processing failed. Request ID: {request_context.request_id}",
         )
 
     logger.info(
@@ -353,9 +361,9 @@ async def clear_conversation(
     # 生成带租户前缀的 scoped key，确保租户隔离
     scoped_conversation_id = request_context.scoped_conversation_id(conversation_id)
 
-    # 同时清除对话记忆和工作记忆
-    container.get_memory().clear(scoped_conversation_id)
-    container.get_work_memory().clear(scoped_conversation_id)
+    # 同时清除对话记忆和工作记忆（Redis 后端同步网络调用包 to_thread，避免阻塞事件循环）
+    await asyncio.to_thread(container.get_memory().clear, scoped_conversation_id)
+    await asyncio.to_thread(container.get_work_memory().clear, scoped_conversation_id)
 
     logger.info(
         "api.conversation.cleared",

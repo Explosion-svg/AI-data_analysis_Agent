@@ -31,7 +31,7 @@ memory/conversation_memory.py — 对话历史管理（三层分层记忆）
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
@@ -149,24 +149,44 @@ class ConversationMemory(BaseConversationMemory):
         *,
         router: "ModelRouter | None" = None,
         breaker: "CircuitBreaker | None" = None,
+        max_conversations: int | None = None,
     ) -> None:
         """
         初始化对话记忆。
 
         Args:
             max_turns: 保留的最大对话轮数（一轮 = 一个 user + 一个 assistant）
-                      None 时从 settings.conversation_max_turns 读取（默认 10 轮）
+                      None 时从 settings.conversation_max_turns 读取（默认 20 轮）
             router: ModelRouter 实例，用于生成滚动摘要。
                    None 表示不使用 LLM 摘要（退化为规则摘要）
             breaker: CircuitBreaker 实例，保护 LLM 摘要调用。
                     当 LLM 不可用时（熔断器 OPEN），退化为规则摘要
+            max_conversations: 进程内最多保留的会话数（LRU 封顶，防长期 OOM）
+                      None 时从 settings.memory_max_conversations 读取
         """
         self._max_turns = max_turns or settings.conversation_max_turns
         self._router = router
         self._breaker = breaker
-        # defaultdict(ConversationState) 确保首次访问任意 conversation_id 都有初始状态
-        # 不需要手动 _store.setdefault(cid, ConversationState())
-        self._store: dict[str, ConversationState] = defaultdict(ConversationState)
+        # P2-18：会话 ID 维度 LRU 封顶，防止按会话数线性膨胀导致 OOM。
+        # 使用 OrderedDict 而不是 defaultdict：插入时维护最近使用顺序，超限驱逐最旧会话。
+        self._max_conversations = max(1, int(max_conversations or settings.memory_max_conversations))
+        self._store: OrderedDict[str, ConversationState] = OrderedDict()
+
+    def _set_state(self, conversation_id: str, state: ConversationState) -> None:
+        """
+        写入会话状态并维护 LRU 上限（P2-18）。
+
+        Redis 变体（RedisConversationMemory）的本地读缓存写入也走这里，
+        保证本地 dict 有界，避免随会话数线性膨胀导致 OOM。
+        """
+        self._store[conversation_id] = state
+        self._store.move_to_end(conversation_id)
+        self._evict_if_needed()
+
+    def _evict_if_needed(self) -> None:
+        """超过上限时驱逐最久未使用的会话（LRU）。"""
+        while len(self._store) > self._max_conversations:
+            _, _ = self._store.popitem(last=False)
 
     async def add(
         self,
@@ -195,7 +215,12 @@ class ConversationMemory(BaseConversationMemory):
             metadata: 可选元数据，仅 pinned_fact/pinned_facts 键会进入长期记忆
         """
         turn = Turn(role=role, content=content, metadata=metadata or {})
-        state = self._store[conversation_id]
+        state = self._store.get(conversation_id)
+        if state is None:
+            state = ConversationState()
+            self._set_state(conversation_id, state)
+        else:
+            self._store.move_to_end(conversation_id)
         state.recent_turns.append(turn)
         self._update_pinned_facts(state, turn)
         await self._roll_recent_turns_into_summary(conversation_id, state)

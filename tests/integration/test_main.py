@@ -84,6 +84,34 @@ async def test_global_exception_handler_returns_500_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_global_exception_handler_does_not_leak_internal_error() -> None:
+    # P2-23：内部异常原文（含数据库 URL/密码）不应回显给客户端，
+    # 只返回通用消息 + request_id，凭 request_id 在日志中定位根因。
+    app = create_app()
+    handler = app.exception_handlers[Exception]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/boom",
+            "headers": [(b"x-request-id", b"req-12345")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 12345),
+            "scheme": "http",
+        }
+    )
+
+    response = await handler(request, RuntimeError("postgresql://user:secret@db:5432/x"))
+
+    assert response.status_code == 500
+    body = response.body.decode()
+    assert "req-12345" in body
+    assert "secret" not in body
+    assert "postgresql" not in body
+
+
+@pytest.mark.asyncio
 async def test_concurrency_limit_handler_returns_503_json() -> None:
     app = create_app()
     handler = app.exception_handlers[ConcurrencyLimitExceeded]

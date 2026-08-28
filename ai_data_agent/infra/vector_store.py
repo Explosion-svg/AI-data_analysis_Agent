@@ -24,8 +24,8 @@ HNSW 算法说明：
   - 如果需要更大规模检索，应考虑迁移到 Milvus / Weaviate / Pinecone
 
 注意：ChromaDB 目前只有同步接口，因此本模块的函数都是同步的，
-但在 async 代码中调用时不会阻塞（ChromaDB 操作通常很快）。
-如果 ChromaDB 操作耗时成为瓶颈，可以用 asyncio.to_thread() 包装。
+在 async 代码中调用时会阻塞事件循环（HNSW + 磁盘 IO）。
+调用方必须用 asyncio.to_thread() 包装（见 schema_context.py / rag_tool.py）。
 """
 from __future__ import annotations
 
@@ -99,6 +99,28 @@ async def init_vector_store() -> None:
         docs=settings.chroma_docs_collection,
         schema=settings.chroma_schema_collection,
     )
+
+
+def close_vector_store() -> None:
+    """
+    关闭 ChromaDB 客户端，释放持久化目录文件锁与资源（P2-20）。
+
+    幂等：未初始化或已关闭时直接返回。
+    ChromaDB 不同版本关闭接口名称不同，这里做防御性探测：
+    - clear_system_cache()：停止内部 System（新版本）
+    - close()：显式关闭（部分版本提供）
+    - 均不存在则仅释放模块单例引用
+    """
+    global _client
+    if _client is None:
+        return
+    closer = getattr(_client, "clear_system_cache", None) or getattr(_client, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception as e:  # pragma: no cover - 防御性
+            logger.warning("vector_store.close_failed", error=str(e))
+    _client = None
 
 
 def get_docs_collection() -> chromadb.Collection:

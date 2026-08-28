@@ -122,6 +122,8 @@ class Settings(BaseSettings):
     sql_query_timeout: float = 30.0                # SQL 执行超时（秒）
     python_exec_timeout: float = 20.0              # Python 代码执行超时（秒）
     agent_max_iterations: int = 10                 # ReAct 循环最大轮次，防止死循环
+    sql_max_rows_cap: int = 1000                   # 单次 SQL 查询结果行数硬上限（P2-12）
+    sql_observation_max_chars: int = 20000         # SQL 观测文本（markdown）字符上限（P2-12）
 
     # 熔断器配置
     circuit_breaker_failure_threshold: int = 5    # 连续失败 N 次后熔断
@@ -153,6 +155,7 @@ class Settings(BaseSettings):
     conversation_max_turns: int = 20              # 对话记忆保留最近 N 轮原始对话
     cache_ttl_seconds: int = 300                  # 结果缓存生存时间（秒）
     cache_max_size: int = 256                     # 内存缓存最大条目数（LRU 淘汰）
+    memory_max_conversations: int = 1000          # 进程内 conversation/work 存储最大会话数（LRU 封顶）
 
     memory_backend: str = "memory"               # 对话/工作记忆后端：memory | redis
     cache_backend: str = "memory"                # 结果缓存后端：memory | redis

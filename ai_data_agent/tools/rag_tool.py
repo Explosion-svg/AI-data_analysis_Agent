@@ -41,6 +41,7 @@ score_threshold 设计：
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ai_data_agent.tools.base_tool import BaseTool, ToolResult
@@ -166,8 +167,10 @@ class RAGTool(BaseTool):
             return ToolResult(success=False, error=f"Embedding failed: {e}")
 
         # Step 2: 向量数据库搜索（余弦相似度）
+        # P2-16：ChromaDB 只有同步接口，包 to_thread 避免阻塞事件循环
         try:
-            docs = vector_store.search_docs(
+            docs = await asyncio.to_thread(
+                vector_store.search_docs,
                 query_embedding=query_embedding,
                 top_k=top_k,
             )

@@ -50,7 +50,7 @@ from typing import Any
 
 from ai_data_agent.observability.logger import get_logger
 from ai_data_agent.observability.metrics import metrics
-from ai_data_agent.reliability.concurrency import get_limiter
+from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded, get_limiter
 
 logger = get_logger(__name__)
 
@@ -265,6 +265,10 @@ class BaseTool(ABC):
                 latency_ms=round(result.latency_ms, 1),
             )
             return result
+        except ConcurrencyLimitExceeded:
+            # P2-10：并发超限属于系统过载，不降级为工具失败（success=False），
+            # 原样上抛，由 main.py 的 503 处理器统一返回 503 Service Unavailable。
+            raise
         except Exception as exc:
             elapsed = (time.perf_counter() - start) * 1000
             metrics.tool_errors_total.labels(tool_name=self.name).inc()

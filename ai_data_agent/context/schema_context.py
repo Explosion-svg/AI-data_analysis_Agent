@@ -28,6 +28,7 @@ context/schema_context.py — Schema 上下文构建器
 """
 from __future__ import annotations
 
+import asyncio
 import re
 
 from ai_data_agent.infra import warehouse, vector_store
@@ -195,7 +196,9 @@ class SchemaContextBuilder:
         try:
             router = get_router()
             embeddings = await router.embed([query])
-            results = vector_store.search_schema(
+            # P2-16：ChromaDB 只有同步接口，包 to_thread 避免阻塞事件循环
+            results = await asyncio.to_thread(
+                vector_store.search_schema,
                 query_embedding=embeddings[0],
                 top_k=top_k,
             )
@@ -258,7 +261,9 @@ class SchemaContextBuilder:
             # 批量向量化（使用 embedding 模型）
             embeddings = await router.embed(docs)
             # 存入 ChromaDB（upsert = 更新已有 + 插入新增）
-            vector_store.upsert_schema(
+            # P2-16：ChromaDB 同步写入包 to_thread，避免阻塞事件循环
+            await asyncio.to_thread(
+                vector_store.upsert_schema,
                 ids=ids,
                 embeddings=embeddings,
                 documents=docs,

@@ -20,6 +20,10 @@ main.py — 应用启动入口
 """
 from __future__ import annotations
 
+import atexit
+import os
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -28,8 +32,19 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from ai_data_agent.api.chat_api import router as chat_router
 from ai_data_agent.config.config import settings
+
+# P2-22：多 worker（uvicorn --workers N）下，每个 worker 是独立进程，
+# Counter/Histogram 若只写各自进程内存，抓取端将看不到其他 worker 的指标
+# （静默丢失 3/4）。必须在任何指标对象创建之前设置 PROMETHEUS_MULTIPROC_DIR，
+# 使各 worker 把指标写入 mmap 文件，再由 metrics 端口所在进程用
+# MultiProcessCollector 聚合（见 assembler._start_metrics_server）。
+if settings.enable_metrics and settings.workers > 1:
+    _prometheus_multiproc_dir = tempfile.mkdtemp(prefix="prometheus_multiproc_")
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = _prometheus_multiproc_dir
+    atexit.register(lambda: shutil.rmtree(_prometheus_multiproc_dir, ignore_errors=True))
+
+from ai_data_agent.api.chat_api import router as chat_router
 from ai_data_agent.assembler import startup as container_startup, shutdown as container_shutdown
 from ai_data_agent.observability.logger import configure_logging, get_logger
 from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded
@@ -159,17 +174,26 @@ def create_app() -> FastAPI:
         捕获所有未被路由层自行处理的异常，统一返回 500。
         注意：这里不应该出现业务异常（业务异常应在路由层转换为 4xx/5xx）。
         出现在这里的通常是系统级错误（数据库连接断开、OOM 等）。
-        exc_info=True 会打印完整堆栈信息，便于排查。
+
+        P2-23：不在响应体回显内部异常原文（str(exc) 可能包含数据库 URL/密码、
+        内部文件路径等敏感信息）。服务端记录完整错误（exc_info=True），
+        客户端只收到通用消息 + request_id，凭 request_id 在日志中定位根因。
         """
+        request_id = request.headers.get("x-request-id") or "unknown"
         logger.error(
             "app.unhandled_exception",
             path=str(request.url),
+            request_id=request_id,
             error=str(exc),
             exc_info=True,
         )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": "Internal server error", "detail": str(exc)},
+            content={
+                "error": "Internal server error",
+                "request_id": request_id,
+                "detail": "An unexpected error occurred. Please contact support with the request_id.",
+            },
         )
 
     # ── 路由注册 ─────────────────────────────────────────────────────────────────

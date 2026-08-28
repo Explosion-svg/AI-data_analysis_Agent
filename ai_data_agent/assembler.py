@@ -42,6 +42,7 @@ assembler.py — 应用装配器（Composition Root）
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -163,34 +164,145 @@ class AppContainer:
 
         logger.info("assembler.startup.begin", env=self.cfg.env.value)
 
-        await self._init_observability()
-        await self._init_infra()
-        await self._init_model_gateway()
-        await self._init_tools()
-        await self._init_context()
-        await self._init_memory()
-        await self._init_orchestration()
-        await self._post_startup()
+        try:
+            await self._init_observability()
+            await self._init_infra()
+            await self._init_model_gateway()
+            await self._init_tools()
+            await self._init_context()
+            await self._init_memory()
+            await self._init_orchestration()
+            await self._post_startup()
+        except Exception:
+            # P2-21：启动中途失败时无条件清理已初始化的资源。
+            # 若此处不清理，K8s CrashLoop 重试会持续累积引擎/连接句柄。
+            # 每个 closer 都是幂等的（未初始化的资源关闭是 no-op）。
+            logger.exception("assembler.startup_failed.cleaning_up")
+            await self._cleanup_partial_startup()
+            raise
 
         self._started = True
         logger.info("assembler.startup.done")
 
     async def shutdown(self) -> None:
         """
-        释放所有资源（数据库连接池、向量数据库等）。
+        释放所有资源（数据库连接池、向量数据库、Redis、LLM 客户端等）。
 
         在 FastAPI lifespan 的 shutdown 阶段调用，对应 K8s 的 SIGTERM 信号处理。
         只有在 _started=True 时才执行清理，避免未完成初始化时执行无效清理。
+
+        P2-20：原来只关 DB 和 warehouse（2/5），
+        现在补齐 Chroma、Redis 客户端、LLM httpx 客户端，并重置模块级单例。
+        每个组件独立 try/except，单个关闭失败不影响其余组件的清理。
         """
         if not self._started:
             return
         logger.info("assembler.shutdown.begin")
-        from ai_data_agent.infra import database, warehouse
-        # 按照与初始化相反的顺序关闭（LIFO 原则）
-        await database.close_db()
-        await warehouse.close_warehouse()
+        for name, closer in self._closers():
+            try:
+                await closer()
+            except Exception as e:
+                logger.warning(f"assembler.shutdown_failed.{name}", error=str(e))
+        self._reset_singletons()
         self._started = False
         logger.info("assembler.shutdown.done")
+
+    def _closers(self) -> list[tuple[str, Any]]:
+        """
+        返回按初始化逆序（LIFO）排列的资源关闭器列表（P2-20）。
+
+        顺序：Orchestration 资源最后初始化，最先关闭；
+        基础设施（DB/warehouse/chroma）最先初始化，最后关闭。
+        """
+        return [
+            ("llm_clients", self._close_llm_clients),
+            ("redis", self._close_redis),
+            ("chroma", self._close_chroma),
+            ("warehouse", self._close_warehouse),
+            ("db", self._close_db),
+        ]
+
+    async def _cleanup_partial_startup(self) -> None:
+        """
+        启动中途失败时的资源清理（P2-21）。
+
+        _started 仍为 False，不会走正常 shutdown() 路径，
+        因此单独实现：按 _closers() 顺序关闭所有资源（幂等），
+        再重置模块级单例，避免留下半初始化的全局状态。
+        """
+        for name, closer in self._closers():
+            try:
+                await closer()
+            except Exception as e:
+                logger.warning(f"assembler.startup_cleanup_failed.{name}", error=str(e))
+        self._reset_singletons()
+
+    # ── 组件关闭器（幂等，可安全重复调用）────────────────────────────────
+
+    async def _close_db(self) -> None:
+        """关闭 OLTP 数据库连接池（P2-20）。未初始化时是 no-op。"""
+        from ai_data_agent.infra import database
+        await database.close_db()
+        self.db_engine = None
+
+    async def _close_warehouse(self) -> None:
+        """关闭 OLAP 数据仓库连接池（P2-20）。未初始化时是 no-op。"""
+        from ai_data_agent.infra import warehouse
+        await warehouse.close_warehouse()
+        self.warehouse_engine = None
+
+    async def _close_chroma(self) -> None:
+        """关闭 ChromaDB 客户端，释放持久化目录文件锁（P2-20）。"""
+        from ai_data_agent.infra import vector_store
+        vector_store.close_vector_store()
+        self.chroma_client = None
+
+    async def _close_redis(self) -> None:
+        """关闭 Redis 记忆/缓存客户端连接池（P2-20）。未初始化或非 Redis 后端时是 no-op。"""
+        for name, mem in [
+            ("conversation", self.conversation_memory),
+            ("cache", self.cache),
+            ("work", self.work_memory),
+        ]:
+            if mem is not None and hasattr(mem, "close"):
+                try:
+                    mem.close()
+                except Exception as e:
+                    logger.warning(f"assembler.redis_close_failed.{name}", error=str(e))
+
+    async def _close_llm_clients(self) -> None:
+        """关闭所有 LLM 适配器背后的 httpx 连接池（P2-20）。"""
+        if self.router is not None and hasattr(self.router, "close"):
+            await self.router.close()
+
+    def _reset_singletons(self) -> None:
+        """
+        重置模块级全局单例，避免热重载/重启后旧资源被引用（P2-20）。
+
+        与 tests/conftest.py 的 reset_singletons fixture 保持一致。
+        database/warehouse/vector_store 的单例已由各自 close 函数重置。
+        """
+        from ai_data_agent.memory import cache_memory, conversation_memory, work_memory
+        from ai_data_agent.model_gateway import router as router_mod
+        from ai_data_agent.tools import tool_registry as tool_registry_mod
+
+        router_mod._router = None
+        conversation_memory._memory = None
+        cache_memory._cache = None
+        work_memory._work_memory = None
+        tool_registry_mod._registry = None
+
+        self.router = None
+        self.tool_registry = None
+        self.prompt_builder = None
+        self.query_rewriter = None
+        self.schema_builder = None
+        self.conversation_memory = None
+        self.cache = None
+        self.work_memory = None
+        self.planner = None
+        self.executor = None
+        self.agent_loop = None
 
     # ── 私有初始化步骤（严格按依赖顺序）────────────────────────────────────
 
@@ -218,17 +330,51 @@ class AppContainer:
 
         if self.cfg.enable_metrics:
             try:
-                from prometheus_client import start_http_server
-                start_http_server(self.cfg.metrics_port)
+                self._start_metrics_server()
                 configured_logger.info("assembler.metrics_server", port=self.cfg.metrics_port)
-            except OSError:
-                # 端口已占用：uvicorn --reload 时进程没有完全退出，端口被前一个进程占用
-                # 直接跳过，不影响主服务
-                configured_logger.debug("assembler.metrics_port_busy", port=self.cfg.metrics_port)
+            except OSError as e:
+                # P2-22：端口冲突升级为 WARNING。
+                # 多 worker 模式下只有一个进程能成功绑定 metrics 端口，
+                # 其余 worker 的本地指标由抓取端通过 multiprocess 模式聚合，
+                # 因此端口绑定失败不阻断主服务，但要明确告警便于排查。
+                configured_logger.warning(
+                    "assembler.metrics_port_busy",
+                    port=self.cfg.metrics_port,
+                    error=str(e),
+                )
             except Exception as e:
                 configured_logger.warning("assembler.metrics_failed", error=str(e))
 
         configured_logger.debug("assembler.observability_ready")
+
+    def _start_metrics_server(self) -> None:
+        """
+        启动 Prometheus 指标 HTTP 服务（P2-22）。
+
+        多 worker（已在 main.py 设置 PROMETHEUS_MULTIPROC_DIR）时，
+        用 MultiProcessCollector 聚合所有 worker 写入的指标文件；
+        单 worker 走默认 registry。
+
+        start_wsgi_server 同步绑定端口，端口冲突会立即抛 OSError，
+        由调用方记录 WARNING（多 worker 下只有一个进程能绑定成功）。
+        """
+        from prometheus_client import REGISTRY, CollectorRegistry
+        from prometheus_client.exposition import start_wsgi_server
+        from prometheus_client.multiprocess import MultiProcessCollector
+
+        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+            # 多 worker：各 worker 指标写入 mmap 文件，
+            # 用 MultiProcessCollector 聚合（文件来自 main.py 创建的临时目录）。
+            registry = CollectorRegistry()
+            MultiProcessCollector(registry)
+        else:
+            # 单 worker：应用指标（AgentMetrics）已注册到默认 registry。
+            registry = REGISTRY
+        start_wsgi_server(
+            port=self.cfg.metrics_port,
+            addr="0.0.0.0",
+            registry=registry,
+        )
 
     async def _init_infra(self) -> None:
         """

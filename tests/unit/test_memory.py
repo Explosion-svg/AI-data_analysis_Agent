@@ -11,6 +11,7 @@ tests/unit/test_memory.py
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 import pytest
 
@@ -18,6 +19,7 @@ from ai_data_agent.memory.cache_memory import CacheMemory
 from ai_data_agent.memory.conversation_memory import ConversationMemory
 from ai_data_agent.memory.conversation_memory import ConversationState, Turn
 from ai_data_agent.memory import redis_conversation_memory as redis_conversation_memory_module
+from ai_data_agent.memory.redis_cache_memory import RedisCacheMemory
 from ai_data_agent.memory.redis_conversation_memory import RedisConversationMemory
 from ai_data_agent.memory.redis_work_memory import RedisWorkMemory
 from ai_data_agent.memory.work_memory import WorkArtifact, WorkState, WorkStep
@@ -62,6 +64,12 @@ class _FakeRedisClient:
         self.expiry: dict[str, int | None] = {}
         self.raise_watch_once = False
         self.watch_error_type = RuntimeError
+        self.ping_fails = False
+
+    def ping(self) -> None:
+        # P2-14：模拟 Redis 故障（ping_fails=True 时抛 RedisError）
+        if self.ping_fails:
+            raise redis_conversation_memory_module.RedisError("redis down")
 
     def pipeline(self) -> _FakeRedisPipeline:
         return _FakeRedisPipeline(self)
@@ -81,24 +89,42 @@ class _FakeRedisClient:
 
 def _build_redis_work_memory() -> RedisWorkMemory:
     memory = RedisWorkMemory.__new__(RedisWorkMemory)
-    memory._store = {}
+    # P2-18：本地读缓存使用 OrderedDict 以支持 LRU 驱逐（与生产实现一致）
+    memory._store = OrderedDict()
     memory._versions = {}
+    memory._max_conversations = 1000
     memory._prefix = "test:work"
     memory._ttl_seconds = 123
     memory._fail_open = False
     memory._available = True
+    memory._health_check_interval = 30.0
     memory._client = _FakeRedisClient()
     return memory
 
 
 def _build_redis_conversation_memory() -> RedisConversationMemory:
     memory = RedisConversationMemory.__new__(RedisConversationMemory)
-    memory._store = {}
+    # P2-18：本地读缓存使用 OrderedDict 以支持 LRU 驱逐（与生产实现一致）
+    memory._store = OrderedDict()
     memory._versions = {}
+    memory._max_conversations = 1000
     memory._prefix = "test:conversation"
     memory._ttl_seconds = 456
     memory._fail_open = False
     memory._available = True
+    memory._health_check_interval = 30.0
+    memory._client = _FakeRedisClient()
+    return memory
+
+
+def _build_redis_cache_memory() -> RedisCacheMemory:
+    memory = RedisCacheMemory.__new__(RedisCacheMemory)
+    memory._prefix = "test:cache"
+    memory._default_ttl = 300
+    memory._fail_open = False
+    memory._health_check_interval = 30.0
+    memory._available = True
+    memory._last_ping = 0.0
     memory._client = _FakeRedisClient()
     return memory
 
@@ -299,3 +325,55 @@ def test_redis_conversation_memory_retries_and_merges_conflicts() -> None:
     assert persisted.rolling_summary == "older summary with more detail"
     assert persisted.pinned_facts == ["tenant=acme", "currency=CNY"]
     assert memory._client.expiry[key] == 456
+
+
+@pytest.mark.asyncio
+async def test_conversation_memory_lru_evicts_oldest() -> None:
+    # P2-18：进程内会话存储 LRU 封顶，超过上限驱逐最久未使用的会话。
+    memory = ConversationMemory(max_turns=20, max_conversations=2)
+    await memory.add("c1", "user", "u1")
+    await memory.add("c2", "user", "u2")
+    # 第 3 个会话加入后超出上限（2），最旧的 c1 应被驱逐。
+    await memory.add("c3", "user", "u3")
+
+    assert memory.get_messages("c1") == []
+    assert len(memory.get_messages("c2")) > 0
+    assert len(memory.get_messages("c3")) > 0
+
+
+def test_redis_memory_recovers_after_transient_failure() -> None:
+    # P2-14：fail-open 单向翻回问题——_available=False 后必须靠周期性 ping 复位。
+    memory = _build_redis_work_memory()
+    memory._fail_open = True  # 恢复探测仅在 fail-open 模式下进行
+    memory._available = False
+    memory._last_ping = time.monotonic() - memory._health_check_interval - 5  # 已进入探测窗口
+
+    # 第一次调用：ping 成功 → available 复位（本次调用仍按不可用返回 None）
+    assert memory._safe_call("get", key="k", fn=lambda: "v") is None
+    assert memory._available is True
+    # 第二次调用：走正常路径，返回真实结果
+    assert memory._safe_call("get", key="k", fn=lambda: "v") == "v"
+    assert memory._available is True
+
+
+def test_redis_memory_ping_failure_keeps_unavailable() -> None:
+    # P2-14：探测 ping 仍失败时应保持不可用，且不阻断调用（fail-open）。
+    memory = _build_redis_work_memory()
+    memory._fail_open = True
+    memory._available = False
+    memory._last_ping = time.monotonic() - memory._health_check_interval - 5
+    memory._client.ping_fails = True
+
+    assert memory._safe_call("get", key="k", fn=lambda: "v") is None
+    assert memory._available is False
+
+
+def test_redis_cache_poisoned_payload_treated_as_miss() -> None:
+    # P2-19：发版后 schema 变更导致 payload 与当前结构不匹配时，
+    # 反序列化异常应按 miss 处理并删除毒化条目，而不是该 key 持续 500。
+    memory = _build_redis_cache_memory()
+    key = "k1"
+    memory._client.store[memory._full_key(key)] = "{not-json"
+
+    assert memory.get(key) is None
+    assert memory._full_key(key) not in memory._client.store

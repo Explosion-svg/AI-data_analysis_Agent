@@ -23,7 +23,8 @@ reliability/circuit_breaker.py — 熔断器（Circuit Breaker）
 设计细节：
   - _lock（asyncio.Lock）保护状态转换，防止并发竞争条件
   - 成功时 CLOSED 状态下会递减失败计数（最低为 0），实现"渐进恢复"
-  - HALF_OPEN 状态下只允许一个试探请求（asyncio.Lock 保证并发安全）
+  - HALF_OPEN 状态下只允许一个试探请求（_probe_inflight 原子认领唯一试探槽位，
+    试探完成前其余 HALF_OPEN 请求按 CircuitBreakerError 拒绝，避免恢复期惊群）
   - CircuitBreakerError 不被 _on_failure 统计（避免因熔断本身触发更多计数）
 
 监控集成：
@@ -118,6 +119,8 @@ class CircuitBreaker:
         self._last_failure_time: float = 0.0
         # asyncio.Lock 确保并发请求不会同时修改状态（防止 HALF_OPEN 状态下多个请求同时试探）
         self._lock = asyncio.Lock()
+        # 半开态唯一试探槽位：True 表示已有试探请求在飞（P2-11 防惊群）
+        self._probe_inflight = False
 
     @property
     def state(self) -> CircuitState:
@@ -176,13 +179,16 @@ class CircuitBreaker:
         调用流程：
         1. _check_state()：检查是否可以从 OPEN 转换到 HALF_OPEN
         2. 如果是 OPEN：拒绝，抛出 CircuitBreakerError（不调用 fn）
-        3. 执行 fn(*args, **kwargs)（CLOSED 或 HALF_OPEN 状态）
-        4. 成功：_on_success()
+        3. 如果是 HALF_OPEN：原子认领唯一试探槽位（_probe_inflight），
+           已有试探在飞时按 CircuitBreakerError 拒绝（P2-11 防惊群）
+        4. 执行 fn(*args, **kwargs)（CLOSED 或已认领试探的 HALF_OPEN）
+        5. 成功：_on_success()
            - HALF_OPEN → CLOSED（服务恢复正常）
            - CLOSED：递减失败计数（min 0）
-        5. 失败：_on_failure()
+        6. 失败：_on_failure()
            - 增加失败计数
            - 如果达到阈值：CLOSED/HALF_OPEN → OPEN（熔断）
+        7. 无论结果如何，finally 中释放试探槽位
 
         异常分类：
         - CircuitBreakerError：不触发 _on_failure（不是服务失败，是熔断拒绝）
@@ -197,7 +203,7 @@ class CircuitBreaker:
             fn 的返回值
 
         Raises:
-            CircuitBreakerError: 熔断器开启，请求被拒绝
+            CircuitBreakerError: 熔断器开启，或半开态已有试探请求在飞，请求被拒绝
             任意 fn 可能抛出的异常（经过 _on_failure 处理后重新抛出）
         """
         await self._check_state()
@@ -209,6 +215,31 @@ class CircuitBreaker:
                 f"Service unavailable. "
                 f"Recovery in {self._recovery_timeout}s."
             )
+
+        if self._state == CircuitState.HALF_OPEN:
+            # P2-11：半开态只放行一个试探请求（锁内原子认领唯一试探槽位）
+            async with self._lock:
+                if self._probe_inflight:
+                    # 已有试探请求在飞，拒绝其余请求，避免恢复期惊群打垮下游
+                    logger.warning("circuit_breaker.half_open_busy", name=self.name)
+                    raise CircuitBreakerError(
+                        f"Circuit breaker '{self.name}' is HALF_OPEN "
+                        f"with a probe request in flight. Try again later."
+                    )
+                self._probe_inflight = True
+            try:
+                result = await fn(*args, **kwargs)
+                await self._on_success()
+                return result
+            except CircuitBreakerError:
+                raise
+            except Exception as exc:
+                await self._on_failure()
+                raise exc
+            finally:
+                # 试探完成（成功/失败/异常）后释放试探槽位
+                async with self._lock:
+                    self._probe_inflight = False
 
         try:
             result = await fn(*args, **kwargs)

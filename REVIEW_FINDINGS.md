@@ -69,87 +69,103 @@
 
 ### 过载雪崩链（9→11 是连锁反应，需一起修）
 
-- [ ] **P2-9 Router 对一切异常重试 + 全适配器 fallback**
+- [x] **P2-9 Router 对一切异常重试 + 全适配器 fallback**
   - 位置：`ai_data_agent/model_gateway/router.py:231, 298-331`
   - 默认 `exceptions=(Exception,)`（`retry.py:51`），本地信号量 1 秒超时（`ConcurrencyLimitExceeded`）也被当成模型失败触发全适配器扫射；最坏一次 Think 调 3×(1+适配器数) 次 API；最终报 `RuntimeError("All LLM adapters failed.")` 掩盖真实原因；每次失败还计入共享 `llm` 熔断器——5 次本地过载（LLM 本身健康）就让熔断器全局打开 60 秒。
   - 修法：`ConcurrencyLimitExceeded` 在 fallback 逻辑前捕获并原样抛出；重试限定 `(RateLimitError, APITimeoutError, APIConnectionError)`；退避 sleep 移出 `limit("llm")` 作用域；fallback 仅在供应商/传输错误时触发。
+  - 处理：`_RETRYABLE_LLM_ERRORS` 限定重试异常；`_call_with_limiter` 把 `limit("llm")` 移到方法内部（退避 sleep 不占并发槽）；`generate()` 先 `except ConcurrencyLimitExceeded: raise` 再走 fallback；fallback 用 `dataclasses.replace` 保留 `top_p/stop/tools` 全部配置。
 
-- [ ] **P2-10 过载返回 500 而非 503，429 不存在**
+- [x] **P2-10 过载返回 500 而非 503，429 不存在**
   - 位置：`ai_data_agent/tools/base_tool.py:249-268`、`ai_data_agent/orchestration/agent_loop.py`（`run()` 的兜底 except）
   - `ConcurrencyLimitExceeded`（RuntimeError 子类）被 `except Exception` 吞成 `ToolResult(success=False)` / `success=False`，`main.py:126` 的 503 处理器永远不触发；`concurrency.py:21,52` 文档声称返回 429——全仓库无任何 429。
   - 修法：在通用 except 前显式 `except ConcurrencyLimitExceeded: raise`；文档对齐。
+  - 处理：`base_tool.py` `run()`、`agent_loop.py` `run()` 与 `_execute_tool_call()` 均在通用 except 前显式 `except ConcurrencyLimitExceeded: raise`，过载原样上抛触发 `main.py` 503 处理器；`concurrency.py` 文档 429 → 503；新增回归测试 `test_base_tool_run_propagates_concurrency_limit`。
 
-- [ ] **P2-11 熔断器 HALF_OPEN 放行惊群**【实测】
+- [x] **P2-11 熔断器 HALF_OPEN 放行惊群**【实测】
   - 位置：`ai_data_agent/reliability/circuit_breaker.py:145-221`
   - `asyncio.Lock` 只保护 OPEN→HALF_OPEN 切换，不限制半开态准入。实测 OPEN 恢复期 10 个并发请求全部放行（10 个同时在飞、0 个拒绝），与模块自己的文档承诺（"HALF_OPEN 只允许一个试探请求"）相反。500 个排队请求会在恢复期同时打向未恢复的服务商并同步再跳闸。
   - 修法：锁内原子认领唯一试探槽位（`_probe_inflight` 标志或跨试探持锁），试探完成前其余 HALF_OPEN 请求按 `CircuitBreakerError` 拒绝。
+  - 处理：`call()` 半开态分支在锁内认领 `_probe_inflight`，已有试探在飞时抛 `CircuitBreakerError`，finally 中锁内释放；新增回归测试 `test_circuit_breaker_half_open_allows_single_probe`（10 并发仅 1 放行、9 拒绝）。
 
 ### 数据与内存
 
-- [ ] **P2-12 SQL 结果无硬上限**
+- [x] **P2-12 SQL 结果无硬上限**
   - 位置：`ai_data_agent/tools/sql_tool.py:154-155, 170-177`
   - LIMIT 注入条件是子串 `"limit"` 出现即跳过（列名 `limited`、注释 `/* limit */` 均可绕过）；`max_rows <= 0` 完全跳过（0 文档含义是"无限制"，且 `max_rows` 由 LLM 控制、无 schema 边界）。`SELECT * LIMIT 5000000` 全量 `fetchall()` + `to_dict` 内存翻倍 + `to_markdown` 逐行渲染进 LLM 观测——内存爆炸 + 上下文/token 成本爆炸。
   - 修法：Python 侧强制封顶（忽略超配置上限的 LIMIT、后截断 DataFrame、观测文本限字符数、`max_rows` 加 JSON Schema min/max）。
+  - 处理：`sql_tool.py` 对 `max_rows` 强制钳制到 `[1, sql_max_rows_cap]`（忽略 LLM 传入的超限值），外层 `SELECT * FROM (...) LIMIT n` 兜底，结果集超限后 `df.head(max_rows)` 后截断，观测 markdown 限 `sql_observation_max_chars` 字符；工具 JSON Schema 给 `max_rows` 加 min/max；新增 3 条回归测试。
 
-- [ ] **P2-13 SQL 表白名单可被绕过**【实测】
+- [x] **P2-13 SQL 表白名单可被绕过**【实测】
   - 位置：`ai_data_agent/reliability/sql_guard.py:76-79, 210-218`
   - 正则 `FROM|JOIN\s+[A-Za-z_]...` 提取不到逗号 join（`FROM allowed, secret` 只取到 `allowed`）和引号标识符（`FROM "secret"` 取到空）。开启 `sql_allowed_tables`（多租户隔离用途）时跨租户读数据。
   - 修法：改用 sqlparse token 树提取（含逗号列表和引号名归一化），或保守拒绝含引号标识符/逗号 join 的语句。
+  - 处理：`sql_guard.py` 改用 sqlparse token 树提取表名（Identifier/IdentifierList 拆分，逗号 join 每张表、引号标识符 `get_real_name` 归一化），`enforce_allowed_tables` 据此拦截跨白名单访问；新增 4 条回归测试。
 
-- [ ] **P2-14 Redis 一次瞬时故障永久失效**
+- [x] **P2-14 Redis 一次瞬时故障永久失效**
   - 位置：`ai_data_agent/memory/redis_conversation_memory.py:162-174`（`redis_work_memory.py:251-263`、`redis_cache_memory.py:168-180` 同款）
   - `_safe_call` 的 fail-open 是单向的：`_available=False` 后只有成功路径能翻回 `True`，而成功路径已不可达。一次 Redis 超时后对话/缓存/工作记忆静默失效直到进程重启。
   - 修法：加恢复探测（`_available=False` 时周期性尝试 `ping()`，成功即复位 + 退避时间戳）。
+  - 处理：三个 `redis_*_memory.py` 的 `_safe_call` 在 `_available=False` 且 fail-open 时按 `_health_check_interval` 间隔尝试 `ping()`，成功即复位 `_available=True`，失败则更新 `_last_ping` 退避；新增 2 条恢复回归测试。
 
-- [ ] **P2-15 同步 redis-py 阻塞事件循环**
+- [x] **P2-15 同步 redis-py 阻塞事件循环**
   - 位置：三个 `redis_*_memory.py`（`from_url` 同步客户端）；调用点 `agent_loop.py:225,271,320,347,451,463,476`、`chat_api.py:353-354`
   - ReAct 循环每次 work memory 变更跑同步 WATCH→GET→SET→EXEC 事务；`DELETE /conversations/{id}` 阻塞网络调用；Redis 抖动（2s socket timeout × retry）冻结整个 worker 数秒。
   - 修法：换 `redis.asyncio`，或全部包 `asyncio.to_thread`。
+  - 处理：所有同步 Redis 调用点（`agent_loop.py` 缓存/工作记忆读写、`chat_api.py` DELETE、三个 `redis_*_memory.py` 内部读写）统一包 `asyncio.to_thread`，同步网络调用不再占用事件循环。
 
-- [ ] **P2-16 ChromaDB 同步查询阻塞事件循环**
+- [x] **P2-16 ChromaDB 同步查询阻塞事件循环**
   - 位置：`ai_data_agent/infra/vector_store.py:26-28`（文档自称"不会阻塞"——不实）；调用点 `schema_context.py:197-201,261`、`rag_tool.py:170`
   - 每个请求的 schema 检索都在 loop 线程跑 HNSW + 磁盘查询。
   - 修法：`asyncio.to_thread` 包裹或提供 async 门面。
+  - 处理：`vector_store.py` 文档声明同步接口必须 to_thread 包装；`schema_context.py` 检索/写入、`rag_tool.py` 检索调用点均包 `asyncio.to_thread`。
 
-- [ ] **P2-17 数据库凭据写入日志**
+- [x] **P2-17 数据库凭据写入日志**
   - 位置：`ai_data_agent/infra/database.py:120`、`warehouse.py:71`（INFO 级输出完整 URL，默认值含 `user:password`）
   - 生产环境密码进 JSON 日志（ELK/Loki 采集）。
   - 修法：`make_url(...).render_as_string(hide_password=True)` 或正则脱敏。
+  - 处理：`database.py:123` 与 `warehouse.py:77` 均改用 `make_url(...).render_as_string(hide_password=True)`，密码不再进入 JSON 日志。
 
-- [ ] **P2-18 进程内 conversation/work 存储无上限增长**
+- [x] **P2-18 进程内 conversation/work 存储无上限增长**
   - 位置：`ai_data_agent/memory/conversation_memory.py:169`、`work_memory.py:194`、Redis 变体的本地 dict（`redis_conversation_memory.py:112-117` 等）
   - 无 LRU/TTL/驱逐，按会话数线性膨胀（单会话状态 ~15-30KB）→ 长跑慢性 OOM。
   - 修法：会话 ID 维度 LRU 封顶；Redis 变体本地 dict 作为有界读缓存。
+  - 处理：`conversation_memory.py`/`work_memory.py` 改用 `OrderedDict` + `move_to_end` + 超限驱逐（`_max_conversations` 上限），Redis 变体本地 dict 走同一写入路径保证有界；新增 LRU 驱逐回归测试。
 
-- [ ] **P2-19 缓存反序列化在 try 块外，毒化条目持续 500**
+- [x] **P2-19 缓存反序列化在 try 块外，毒化条目持续 500**
   - 位置：`ai_data_agent/memory/redis_cache_memory.py:77-86`（仅 `json.loads` 被守护，`_deserialize` 没有）；调用点 `agent_loop.py:223-234` 在 try 之外
   - 缓存 payload 与当前 `AgentResponse` 字段不匹配（发版后 schema 变更）→ 该 key 每次命中 TypeError → HTTP 500 直到 TTL 过期。
   - 修法：反序列化异常按 miss 处理；缓存查询移入错误处理路径。
+  - 处理：`redis_cache_memory.get()` 将 `json.loads` + `_deserialize` 全部纳入 try，异常按 miss 处理并立即 `delete()` 毒化条目；新增回归测试。
 
 ### 生命周期
 
-- [ ] **P2-20 优雅关闭只清理 2/5 类资源**
+- [x] **P2-20 优雅关闭只清理 2/5 类资源**
   - 位置：`ai_data_agent/assembler.py:188-191`
   - 只关 DB 和 warehouse；AsyncOpenAI 背后的 httpx 客户端、Redis 连接池、Chroma 客户端、模块单例（`_router`/`_memory`/`_cache` 等）全部泄漏。
   - 修法：适配器加 `aclose()`，`shutdown()` 统一调用并重置单例。
+  - 处理：`base_model.py`/`openai_model.py` 加 `aclose()`、`router.py` 加 `close()`、三个 Redis 记忆类加 `close()`、`vector_store.py` 加 `close_vector_store()`；`assembler.shutdown()` 按 `_closers()`（LIFO：llm→redis→chroma→warehouse→db）统一关闭并 `_reset_singletons()`；新增关闭顺序回归测试。
 
-- [ ] **P2-21 启动中途失败零清理**
+- [x] **P2-21 启动中途失败零清理**
   - 位置：`ai_data_agent/main.py:75` + `assembler.py:185-186`
   - lifespan 在 `yield` 前抛异常则 `shutdown()` 不执行，且 `_started=False` 时 `shutdown()` 拒绝运行。K8s CrashLoop 重试累积引擎/连接。
   - 修法：跟踪已初始化组件，失败路径无条件清理。
+  - 处理：`startup()` 的 except 分支无条件调用 `_cleanup_partial_startup()`（按 `_closers()` 幂等关闭 + 单例重置）后 re-raise；新增启动失败清理回归测试。
 
-- [ ] **P2-22 多 worker 下 3/4 Prometheus 指标静默丢失**
+- [x] **P2-22 多 worker 下 3/4 Prometheus 指标静默丢失**
   - 位置：`ai_data_agent/assembler.py:219-229`（端口冲突吞掉且只记 DEBUG）；`main.py:19` 还推荐 `--workers 4`
   - 修法：冲突记 WARNING；用 `prometheus_client.multiprocess` 模式。
+  - 处理：`main.py` 多 worker 时设置 `PROMETHEUS_MULTIPROC_DIR`（mmap 指标文件，atexit 清理），`assembler._start_metrics_server` 用 `MultiProcessCollector` 聚合；端口冲突升级为 WARNING。
 
-- [ ] **P2-23 内部异常原文返回给客户端**
+- [x] **P2-23 内部异常原文返回给客户端**
   - 位置：`ai_data_agent/main.py:170-173`、`chat_api.py:263-267`
   - DB 连接错误会把 `postgresql://user:password@...` 回显在 HTTP 响应体里。
   - 修法：服务端记日志，客户端返回通用消息 + request_id。
+  - 处理：全局异常处理器与 `chat_api` agent 失败路径只返回通用消息 + `request_id`，服务端记完整错误（`exc_info=True`）；新增无泄露回归测试。
 
-- [ ] **P2-24 只读保护纯文本层，连接本身可写**
+- [x] **P2-24 只读保护纯文本层，连接本身可写**
   - 位置：`ai_data_agent/reliability/sql_guard.py:139-170`（三层校验全 gated on `sql_readonly`，关掉即 DML/DDL 通行；`ATTACH 'evil.db'` 不带 `DATABASE` 关键字可绕过正则，目前仅靠 sqlparse 类型检查兜底）+ `warehouse.py:67`（引擎可写）
   - 修法：引擎层强制只读（SQLite `mode=ro` URI / Postgres 只读角色 / `SET default_transaction_read_only=on`）。
+  - 处理：`warehouse.py` 在引擎建立后通过 `connect` 事件对每个连接执行 `PRAGMA query_only = ON`（SQLite）/ `SET default_transaction_read_only = on`（Postgres），连接层拒绝写；`test_warehouse.py` 适配验证写操作被拒。
 
 ---
 

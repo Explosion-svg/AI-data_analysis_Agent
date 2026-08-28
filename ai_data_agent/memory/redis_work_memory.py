@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
+import time
 
 from ai_data_agent.config.config import settings
 from ai_data_agent.memory.work_memory import (
@@ -54,6 +55,7 @@ class RedisWorkMemory(WorkMemory):
         self._prefix = prefix.rstrip(":")
         self._ttl_seconds = max(60, int(ttl_seconds))
         self._fail_open = fail_open
+        self._health_check_interval = float(health_check_interval)
         self._client = Redis.from_url(
             redis_url,
             decode_responses=True,
@@ -63,10 +65,27 @@ class RedisWorkMemory(WorkMemory):
             retry_on_timeout=retry_on_timeout,
         )
         self._available = True
+        self._last_ping = time.monotonic()
         self._versions: dict[str, int] = {}
 
         if startup_check:
             self._ping_on_startup()
+
+    def close(self) -> None:
+        """
+        关闭 Redis 客户端连接池（P2-20）。
+
+        应用优雅关闭时由 AppContainer.shutdown() 调用。
+        幂等：客户端已关闭时直接返回，可重复调用。
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as e:  # pragma: no cover - 防御性
+            logger.warning("redis_work_memory.close_failed", error=str(e))
+        self._client = None
 
     def start_run(self, conversation_id: str, query: str) -> WorkState:
         state = super().start_run(conversation_id, query)
@@ -79,7 +98,7 @@ class RedisWorkMemory(WorkMemory):
             return state
         loaded = self._load_state(conversation_id)
         if loaded is not None:
-            self._store[conversation_id] = loaded
+            self._set_state(conversation_id, loaded)
         return loaded
 
     def clear(self, conversation_id: str) -> None:
@@ -250,6 +269,14 @@ class RedisWorkMemory(WorkMemory):
 
     def _safe_call(self, op: str, *, key: str | None, fn) -> Any:
         if not self._available and self._fail_open:
+            # P2-14：瞬时故障后的周期性恢复探测（fail-open 单向翻回问题）。
+            if time.monotonic() - self._last_ping >= self._health_check_interval:
+                try:
+                    self._client.ping()
+                    self._available = True
+                    logger.info("redis_work_memory.recovered", prefix=self._prefix)
+                except RedisError:
+                    self._last_ping = time.monotonic()
             return None
         try:
             result = fn()
@@ -257,6 +284,7 @@ class RedisWorkMemory(WorkMemory):
             return result
         except RedisError as e:
             self._available = False
+            self._last_ping = time.monotonic()
             self._handle_error(op, e, key=key)
             if self._fail_open:
                 return None
@@ -295,7 +323,7 @@ class RedisWorkMemory(WorkMemory):
                     pipe.set(key, payload, ex=self._ttl_seconds)
                     pipe.execute()
                     self._versions[conversation_id] = expected_version + 1
-                    self._store[conversation_id] = merged_state
+                    self._set_state(conversation_id, merged_state)
                     return True
                 except WatchError:
                     continue

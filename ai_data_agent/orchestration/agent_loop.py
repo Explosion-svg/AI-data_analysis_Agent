@@ -36,6 +36,7 @@ ReAct 模式原理（每轮循环）：
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -48,7 +49,7 @@ from ai_data_agent.model_gateway.base_model import Message
 from ai_data_agent.model_gateway.router import TaskType
 from ai_data_agent.observability.logger import get_logger
 from ai_data_agent.observability.metrics import metrics
-from ai_data_agent.reliability.concurrency import get_limiter
+from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded, get_limiter
 from ai_data_agent.observability.tracer import span
 
 if TYPE_CHECKING:
@@ -222,7 +223,8 @@ class AgentLoop:
                 # 缓存检查（只在成功路径缓存，失败不缓存）
                 cache_key = self._cache.make_key("agent", req_ctx.tenant_id, query, conversation_id)
                 if use_cache:
-                    cached = self._cache.get(cache_key)
+                    # P2-15：Redis 缓存同步读包 to_thread，避免阻塞事件循环
+                    cached = await asyncio.to_thread(self._cache.get, cache_key)
                     if cached:
                         logger.info(
                             "agent_loop.cache_hit",
@@ -240,9 +242,13 @@ class AgentLoop:
                         scoped_conversation_id=scoped_conversation_id,
                         request_context=req_ctx,
                     )
+                except ConcurrencyLimitExceeded:
+                    # P2-10：并发过载不降级为 success=False 响应，
+                    # 原样上抛，交由 main.py 的 503 处理器返回 503 Service Unavailable。
+                    raise
                 except Exception as e:
                     # 失败时更新工作记忆状态（为了快照显示正确的失败状态）
-                    self._work_memory.fail_run(scoped_conversation_id, str(e))
+                    await asyncio.to_thread(self._work_memory.fail_run, scoped_conversation_id, str(e))
                     logger.error(
                         "agent_loop.failed",
                         request_id=req_ctx.request_id,
@@ -268,7 +274,7 @@ class AgentLoop:
 
         # 只缓存成功结果
         if use_cache and response.success:
-            self._cache.set(cache_key, response)
+            await asyncio.to_thread(self._cache.set, cache_key, response)
 
         return response
 
@@ -317,7 +323,7 @@ class AgentLoop:
             AgentResponse（成功时的完整响应）
         """
         # 为本次请求建立新的工作状态（覆盖同 conversation 的旧状态）
-        self._work_memory.start_run(scoped_conversation_id, query)
+        await asyncio.to_thread(self._work_memory.start_run, scoped_conversation_id, query)
 
         # 阶段一：准备初始消息列表和 schema 上下文
         messages, schema_ctx = await self._build_initial_messages(
@@ -344,7 +350,7 @@ class AgentLoop:
 
         while iteration < settings.agent_max_iterations:
             iteration += 1
-            self._work_memory.set_iterations(scoped_conversation_id, iteration)
+            await asyncio.to_thread(self._work_memory.set_iterations, scoped_conversation_id, iteration)
             logger.debug(
                 "agent_loop.iteration",
                 request_id=request_context.request_id,
@@ -448,19 +454,22 @@ class AgentLoop:
         # Step 1: Query Rewriting（LLM 改写，提高 schema/RAG 召回率）
         rewrite_result = await self._query_rewriter.rewrite(query)
         logger.debug("agent_loop.rewrite", result=rewrite_result)
-        self._work_memory.set_rewritten_query(
+        await asyncio.to_thread(
+            self._work_memory.set_rewritten_query,
             scoped_conversation_id,
             rewrite_result.get("rewritten", ""),
         )
         if rewrite_result.get("reason"):
-            self._work_memory.add_finding(
+            await asyncio.to_thread(
+                self._work_memory.add_finding,
                 scoped_conversation_id,
                 f"Query rewritten rationale: {rewrite_result['reason']}",
             )
 
         # Step 2: Schema Context（语义检索相关表结构）
         schema_ctx = await self._schema_builder.build(query)
-        self._work_memory.set_schema_context(
+        await asyncio.to_thread(
+            self._work_memory.set_schema_context,
             scoped_conversation_id,
             schema_ctx,
             selected_tables=self._schema_builder.extract_table_names(schema_ctx),
@@ -473,7 +482,7 @@ class AgentLoop:
         )
 
         # Step 4: 获取历史消息（三层记忆 → Messages）
-        history = self._memory.get_messages(scoped_conversation_id)
+        history = await asyncio.to_thread(self._memory.get_messages, scoped_conversation_id)
 
         # Step 5: 组装完整消息列表
         return self._prompt_builder.build(
@@ -533,11 +542,12 @@ class AgentLoop:
             return None
 
         # 记录 Plan-and-Execute 决策（方便调试）
-        self._work_memory.add_finding(
+        await asyncio.to_thread(
+            self._work_memory.add_finding,
             scoped_conversation_id,
             f"Planner selected {plan.complexity} plan with {len(plan.steps)} steps.",
         )
-        self._work_memory.set_iterations(scoped_conversation_id, len(plan.steps))
+        await asyncio.to_thread(self._work_memory.set_iterations, scoped_conversation_id, len(plan.steps))
 
         # 让 Executor 按拓扑顺序执行所有步骤
         steps = await self._executor.execute(plan, schema_context=schema_context)
@@ -580,14 +590,16 @@ class AgentLoop:
             rag_tool = self._registry.get("search_documents")
             rag_result = await rag_tool.run(query=query)
             if rag_result.success and rag_result.data:
-                self._work_memory.add_finding(
+                await asyncio.to_thread(
+                    self._work_memory.add_finding,
                     scoped_conversation_id,
                     f"Retrieved {len(rag_result.data)} relevant knowledge document(s).",
                 )
                 return rag_result.data
         except Exception as e:
             logger.debug("agent_loop.rag_skip", error=str(e))
-            self._work_memory.add_finding(
+            await asyncio.to_thread(
+                self._work_memory.add_finding,
                 scoped_conversation_id,
                 f"RAG retrieval skipped: {e}",
             )
@@ -648,7 +660,8 @@ class AgentLoop:
         tool_args = self._parse_tool_args(tool_args_str)
 
         # 记录工具步骤开始（在执行前，保证快照中有 running 状态记录）
-        work_step = self._work_memory.start_tool_step(
+        work_step = await asyncio.to_thread(
+            self._work_memory.start_tool_step,
             conversation_id=scoped_conversation_id,
             iteration=iteration,
             tool=tool_name,
@@ -666,7 +679,7 @@ class AgentLoop:
         if tool_name == "sql_query":
             sql = tool_args.get("sql")
             if isinstance(sql, str):
-                self._work_memory.set_latest_sql(scoped_conversation_id, sql)
+                await asyncio.to_thread(self._work_memory.set_latest_sql, scoped_conversation_id, sql)
 
         # 执行工具（三种可能的错误路径）
         try:
@@ -675,6 +688,9 @@ class AgentLoop:
         except KeyError:
             observation = f"Error: Tool '{tool_name}' not found."
             tool_result = None
+        except ConcurrencyLimitExceeded:
+            # P2-10：工具并发超限属于系统过载，不降级为观察消息，原样上抛。
+            raise
         except Exception as e:
             observation = f"Error executing tool '{tool_name}': {e}"
             tool_result = None
@@ -685,7 +701,8 @@ class AgentLoop:
                 {"tool": tool_name, "args": tool_args, "success": tool_result.success}
             )
             # 处理工具成功执行后的附带副作用
-            self._apply_tool_result_side_effects(
+            await asyncio.to_thread(
+                self._apply_tool_result_side_effects,
                 tool_name=tool_name,
                 tool_result=tool_result,
                 scoped_conversation_id=scoped_conversation_id,
@@ -700,7 +717,8 @@ class AgentLoop:
             observation,
         )
         # 记录工具步骤完成
-        self._work_memory.finish_tool_step(
+        await asyncio.to_thread(
+            self._work_memory.finish_tool_step,
             scoped_conversation_id,
             work_step.step_id,
             success=bool(tool_result and tool_result.success),
@@ -827,7 +845,7 @@ class AgentLoop:
             iterations=iteration,
         )
         # 标记工作状态完成
-        self._work_memory.complete_run(scoped_conversation_id, final_answer)
+        await asyncio.to_thread(self._work_memory.complete_run, scoped_conversation_id, final_answer)
 
         # 构建 ConversationMemory 写回的 metadata
         bridge_meta = await self._build_conversation_metadata(
@@ -968,7 +986,8 @@ class AgentLoop:
                 continue
             if success and step.result:
                 # 处理成功步骤的副作用
-                self._apply_tool_result_side_effects(
+                await asyncio.to_thread(
+                    self._apply_tool_result_side_effects,
                     tool_name=step.tool,
                     tool_result=step.result,
                     scoped_conversation_id=scoped_conversation_id,
@@ -976,12 +995,14 @@ class AgentLoop:
                 )
                 if step.tool == "sql_query":
                     latest_data = step.result.data or []
-                self._work_memory.add_finding(
+                await asyncio.to_thread(
+                    self._work_memory.add_finding,
                     scoped_conversation_id,
                     f"Plan step {step.step} [{step.tool}] succeeded.",
                 )
             elif step.error:
-                self._work_memory.add_finding(
+                await asyncio.to_thread(
+                    self._work_memory.add_finding,
                     scoped_conversation_id,
                     f"Plan step {step.step} [{step.tool}] failed: {step.error[:200]}",
                 )

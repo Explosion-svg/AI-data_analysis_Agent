@@ -8,7 +8,9 @@ memory/redis_conversation_memory.py — Redis 会话记忆
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -56,6 +58,7 @@ class RedisConversationMemory(ConversationMemory):
         self._prefix = prefix.rstrip(":")
         self._ttl_seconds = max(300, int(ttl_seconds))
         self._fail_open = fail_open
+        self._health_check_interval = float(health_check_interval)
         self._client = Redis.from_url(
             redis_url,
             decode_responses=True,
@@ -65,6 +68,7 @@ class RedisConversationMemory(ConversationMemory):
             retry_on_timeout=retry_on_timeout,
         )
         self._available = True
+        self._last_ping = time.monotonic()
         self._versions: dict[str, int] = {}
 
         if startup_check:
@@ -77,9 +81,10 @@ class RedisConversationMemory(ConversationMemory):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        self._ensure_loaded(conversation_id)
+        # P2-15：Redis 读/写都是同步网络调用，包 to_thread 避免阻塞事件循环
+        await asyncio.to_thread(self._ensure_loaded, conversation_id)
         await super().add(conversation_id, role, content, metadata)
-        self._persist_if_present(conversation_id)
+        await asyncio.to_thread(self._persist_if_present, conversation_id)
 
     def get_messages(self, conversation_id: str):
         self._ensure_loaded(conversation_id)
@@ -114,7 +119,7 @@ class RedisConversationMemory(ConversationMemory):
             return
         loaded = self._load_state(conversation_id)
         if loaded is not None:
-            self._store[conversation_id] = loaded
+            self._set_state(conversation_id, loaded)
 
     def _persist_if_present(self, conversation_id: str) -> None:
         state = self._store.get(conversation_id)
@@ -159,8 +164,34 @@ class RedisConversationMemory(ConversationMemory):
             if not self._fail_open:
                 raise RuntimeError(f"Redis conversation memory startup check failed: {e}") from e
 
+    def close(self) -> None:
+        """
+        关闭 Redis 客户端连接池（P2-20）。
+
+        应用优雅关闭时由 AppContainer.shutdown() 调用。
+        幂等：客户端已关闭时直接返回，可重复调用。
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as e:  # pragma: no cover - 防御性
+            logger.warning("redis_conversation_memory.close_failed", error=str(e))
+        self._client = None
+
     def _safe_call(self, op: str, *, key: str | None, fn) -> Any:
         if not self._available and self._fail_open:
+            # P2-14：瞬时故障后的周期性恢复探测。
+            # fail-open 是单向的（只有成功路径能翻回 True），
+            # 因此不可用时周期性 ping，Redis 恢复后自动复位。
+            if time.monotonic() - self._last_ping >= self._health_check_interval:
+                try:
+                    self._client.ping()
+                    self._available = True
+                    logger.info("redis_conversation_memory.recovered", prefix=self._prefix)
+                except RedisError:
+                    self._last_ping = time.monotonic()
             return None
         try:
             result = fn()
@@ -168,6 +199,7 @@ class RedisConversationMemory(ConversationMemory):
             return result
         except RedisError as e:
             self._available = False
+            self._last_ping = time.monotonic()
             self._handle_error(op, e, key=key)
             if self._fail_open:
                 return None
@@ -206,7 +238,7 @@ class RedisConversationMemory(ConversationMemory):
                     pipe.set(key, payload, ex=self._ttl_seconds)
                     pipe.execute()
                     self._versions[conversation_id] = expected_version + 1
-                    self._store[conversation_id] = merged_state
+                    self._set_state(conversation_id, merged_state)
                     return True
                 except WatchError:
                     continue

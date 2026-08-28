@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -50,6 +51,7 @@ class RedisCacheMemory(BaseCacheMemory):
         self._prefix = prefix.rstrip(":")
         self._default_ttl = max(1, int(default_ttl))
         self._fail_open = fail_open
+        self._health_check_interval = float(health_check_interval)
         self._client = Redis.from_url(
             redis_url,
             decode_responses=True,
@@ -59,9 +61,26 @@ class RedisCacheMemory(BaseCacheMemory):
             retry_on_timeout=retry_on_timeout,
         )
         self._available = True
+        self._last_ping = time.monotonic()
 
         if startup_check:
             self._ping_on_startup()
+
+    def close(self) -> None:
+        """
+        关闭 Redis 客户端连接池（P2-20）。
+
+        应用优雅关闭时由 AppContainer.shutdown() 调用。
+        幂等：客户端已关闭时直接返回，可重复调用。
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception as e:  # pragma: no cover - 防御性
+            logger.warning("redis_cache.close_failed", error=str(e))
+        self._client = None
 
     @staticmethod
     def make_key(*parts: Any) -> str:
@@ -74,16 +93,21 @@ class RedisCacheMemory(BaseCacheMemory):
             metrics.cache_misses_total.inc()
             return None
 
+        # P2-19：json 解析与反序列化全部纳入 try。
+        # 发版后 schema 变更导致 payload 与当前 AgentResponse 字段不匹配时，
+        # 把毒化条目按 miss 处理并立即删除，避免该 key 持续 500 直到 TTL 过期。
         try:
             parsed = json.loads(value)
-        except json.JSONDecodeError:
-            logger.warning("redis_cache.invalid_json", key=key[:16])
+            result = self._deserialize(parsed)
+        except Exception:
+            logger.warning("redis_cache.invalid_payload", key=key[:16])
+            self.delete(key)
             metrics.cache_misses_total.inc()
             return None
 
         metrics.cache_hits_total.inc()
         logger.debug("redis_cache.hit", key=key[:16])
-        return self._deserialize(parsed)
+        return result
 
     def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         ttl_s = max(1, int(ttl if ttl is not None else self._default_ttl))
@@ -167,6 +191,14 @@ class RedisCacheMemory(BaseCacheMemory):
 
     def _safe_call(self, op: str, *, key: str | None, fn) -> Any:
         if not self._available and self._fail_open:
+            # P2-14：瞬时故障后的周期性恢复探测（fail-open 单向翻回问题）。
+            if time.monotonic() - self._last_ping >= self._health_check_interval:
+                try:
+                    self._client.ping()
+                    self._available = True
+                    logger.info("redis_cache.recovered", prefix=self._prefix)
+                except RedisError:
+                    self._last_ping = time.monotonic()
             return None
         try:
             result = fn()
@@ -174,6 +206,7 @@ class RedisCacheMemory(BaseCacheMemory):
             return result
         except RedisError as e:
             self._available = False
+            self._last_ping = time.monotonic()
             self._handle_error(op, e, key=key)
             if self._fail_open:
                 return None
