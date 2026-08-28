@@ -17,6 +17,7 @@ from fastapi import Request
 
 from ai_data_agent.config.config import Env, settings
 from ai_data_agent.main import create_app, lifespan
+from ai_data_agent.reliability.concurrency import ConcurrencyLimitExceeded
 
 
 @pytest.mark.asyncio
@@ -80,3 +81,27 @@ async def test_global_exception_handler_returns_500_json() -> None:
 
     assert response.status_code == 500
     assert b"Internal server error" in response.body
+
+
+@pytest.mark.asyncio
+async def test_concurrency_limit_handler_returns_503_json() -> None:
+    app = create_app()
+    handler = app.exception_handlers[ConcurrencyLimitExceeded]
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/chat",
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 12345),
+            "scheme": "http",
+        }
+    )
+
+    response = await handler(request, ConcurrencyLimitExceeded("llm", 1.0))
+
+    assert response.status_code == 503
+    assert b"Service overloaded" in response.body
+    assert b"llm" in response.body

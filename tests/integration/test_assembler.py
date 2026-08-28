@@ -15,7 +15,6 @@ import pytest
 from ai_data_agent.assembler import AppContainer
 from ai_data_agent.memory.cache_memory import CacheMemory
 from ai_data_agent.memory.conversation_memory import ConversationMemory
-from ai_data_agent.orchestration.agent_loop import AgentLoop
 from ai_data_agent.orchestration.executor import Executor
 from ai_data_agent.orchestration.planner import Planner
 from ai_data_agent.tools.tool_registry import ToolRegistry
@@ -80,9 +79,10 @@ def test_assembler_health_report() -> None:
     container.tool_registry = ToolRegistry()
     container.conversation_memory = ConversationMemory()
     container.cache = CacheMemory()
+    container.work_memory = type("FakeWorkMemory", (), {"stats": lambda self: {"active_runs": 0}})()
     container.planner = Planner()
     container.executor = Executor()
-    container.agent_loop = AgentLoop()
+    container.agent_loop = object()  # 这里只验证 health_report 结构，不依赖真实 AgentLoop 行为
 
     report = container.health_report()
 

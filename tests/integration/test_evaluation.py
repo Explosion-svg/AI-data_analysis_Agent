@@ -45,7 +45,13 @@ async def test_eval_runner_run_and_report(monkeypatch: pytest.MonkeyPatch) -> No
                 success=True,
             )
 
-    monkeypatch.setattr("ai_data_agent.evaluation.eval_runner.AgentLoop", FakeAgentLoop)
+    fake_agent = FakeAgentLoop()
+
+    class FakeContainer:
+        def get_agent_loop(self):
+            return fake_agent
+
+    monkeypatch.setattr("ai_data_agent.evaluation.eval_runner.get_container", lambda: FakeContainer())
     report = await EvalRunner(concurrency=2).run(dataset=dataset, conversation_prefix="t")
 
     assert report.total == 2
@@ -62,7 +68,11 @@ async def test_eval_runner_run_case_handles_agent_exception(monkeypatch: pytest.
         async def run(self, query: str, conversation_id: str, use_cache: bool = False) -> AgentResponse:
             raise RuntimeError("agent crashed")
 
-    monkeypatch.setattr("ai_data_agent.evaluation.eval_runner.AgentLoop", FakeAgentLoop)
+    class FakeContainer:
+        def get_agent_loop(self):
+            return FakeAgentLoop()
+
+    monkeypatch.setattr("ai_data_agent.evaluation.eval_runner.get_container", lambda: FakeContainer())
     case = EvalCase(id="case1", question="q1")
     result = await EvalRunner()._run_case(case, "conv_1", asyncio.Semaphore(1))
 

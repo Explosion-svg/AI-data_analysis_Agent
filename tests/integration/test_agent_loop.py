@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import pytest
 
+from ai_data_agent.context.request_context import RequestContext
 from ai_data_agent.model_gateway.base_model import LLMResponse, Message
-from ai_data_agent.orchestration.agent_loop import AgentLoop, AgentResponse
+from ai_data_agent.orchestration.agent_loop import AgentResponse
 from ai_data_agent.tools.base_tool import BaseTool, ToolResult
 from ai_data_agent.tools.tool_registry import ToolRegistry
-from tests.helpers import DummyBreaker, DummyCache, DummyMemory, SequenceRouter
+from tests.helpers import DummyCache, DummyMemory, SequenceRouter, build_test_agent
 
 
 class FakeRAGTool(BaseTool):
@@ -57,15 +58,19 @@ async def test_agent_loop_returns_cached_response(monkeypatch: pytest.MonkeyPatc
     # 缓存命中时，AgentLoop 不应继续执行 ReAct 主循环。
     cached = AgentResponse(answer="cached", conversation_id="c1", success=True)
     cache = DummyCache(value=cached)
-    agent = AgentLoop()
+    agent = build_test_agent(router=SequenceRouter([]), cache=cache)
 
     async def should_not_run(*args, **kwargs):
         raise AssertionError("_react_loop should not be called on cache hit")
 
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_cache", lambda: cache)
     monkeypatch.setattr(agent, "_react_loop", should_not_run)
 
-    resp = await agent.run("query", "c1", use_cache=True)
+    resp = await agent.run(
+        "query",
+        "c1",
+        request_context=RequestContext("r1", "u1", "t1"),
+        use_cache=True,
+    )
 
     assert resp.answer == "cached"
 
@@ -76,7 +81,7 @@ async def test_agent_loop_direct_answer(monkeypatch: pytest.MonkeyPatch) -> None
     router = SequenceRouter([LLMResponse(content="final answer", model="fake", tool_calls=None)])
     memory = DummyMemory()
     registry = ToolRegistry()
-    agent = AgentLoop()
+    agent = build_test_agent(router=router, memory=memory, registry=registry)
 
     async def rewrite(query: str):
         return {"rewritten": query, "alternatives": [], "keywords": [], "all_queries": [query]}
@@ -87,16 +92,21 @@ async def test_agent_loop_direct_answer(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(agent._query_rewriter, "rewrite", rewrite)
     monkeypatch.setattr(agent._schema_builder, "build", build_schema)
     monkeypatch.setattr(agent._prompt_builder, "build", lambda **kwargs: [Message(role="user", content=kwargs["query"])])
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_memory", lambda: memory)
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_registry", lambda: registry)
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_router", lambda: router)
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_breaker", lambda name: DummyBreaker())
+    async def no_pinned(**kwargs):
+        return []
+    monkeypatch.setattr(agent, "_extract_pinned_facts", no_pinned)
 
-    resp = await agent.run("query", "c1", use_cache=False)
+    resp = await agent.run(
+        "query",
+        "c1",
+        request_context=RequestContext("r1", "u1", "t1"),
+        use_cache=False,
+    )
 
     assert resp.success is True
     assert resp.answer == "final answer"
-    assert memory.added == [("c1", "user", "query"), ("c1", "assistant", "final answer")]
+    assert memory.added[0][:3] == ("t1:c1", "user", "query")
+    assert memory.added[1][:3] == ("t1:c1", "assistant", "final answer")
 
 
 @pytest.mark.asyncio
@@ -121,7 +131,7 @@ async def test_agent_loop_tool_call_then_final_answer(monkeypatch: pytest.Monkey
         ]
     )
     memory = DummyMemory()
-    agent = AgentLoop()
+    agent = build_test_agent(router=router, memory=memory, registry=registry)
 
     async def rewrite(query: str):
         return {"rewritten": query, "alternatives": [], "keywords": [], "all_queries": [query]}
@@ -132,12 +142,16 @@ async def test_agent_loop_tool_call_then_final_answer(monkeypatch: pytest.Monkey
     monkeypatch.setattr(agent._query_rewriter, "rewrite", rewrite)
     monkeypatch.setattr(agent._schema_builder, "build", build_schema)
     monkeypatch.setattr(agent._prompt_builder, "build", lambda **kwargs: [Message(role="user", content=kwargs["query"])])
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_memory", lambda: memory)
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_registry", lambda: registry)
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_router", lambda: router)
-    monkeypatch.setattr("ai_data_agent.orchestration.agent_loop.get_breaker", lambda name: DummyBreaker())
+    async def no_pinned(**kwargs):
+        return []
+    monkeypatch.setattr(agent, "_extract_pinned_facts", no_pinned)
 
-    resp = await agent.run("query", "c1", use_cache=False)
+    resp = await agent.run(
+        "query",
+        "c1",
+        request_context=RequestContext("r1", "u1", "t1"),
+        use_cache=False,
+    )
 
     assert resp.success is True
     assert resp.answer == "analysis done"

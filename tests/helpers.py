@@ -18,7 +18,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ai_data_agent.context.prompt_builder import PromptBuilder
+from ai_data_agent.context.query_rewriter import QueryRewriter
+from ai_data_agent.context.schema_context import SchemaContextBuilder
+from ai_data_agent.memory.cache_memory import CacheMemory
+from ai_data_agent.memory.work_memory import WorkMemory
 from ai_data_agent.model_gateway.base_model import LLMResponse, Message
+from ai_data_agent.orchestration.agent_loop import AgentLoop
+from ai_data_agent.tools.tool_registry import ToolRegistry
 
 
 @dataclass
@@ -30,13 +37,22 @@ class DummyBreaker:
 class DummyMemory:
     def __init__(self, history: list[Message] | None = None) -> None:
         self.history = history or []
-        self.added: list[tuple[str, str, str]] = []
+        self.added: list[tuple[str, str, str, dict[str, Any] | None]] = []
 
     def get_messages(self, conversation_id: str) -> list[Message]:
         return list(self.history)
 
-    def add(self, conversation_id: str, role: str, content: str) -> None:
-        self.added.append((conversation_id, role, content))
+    async def add(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.added.append((conversation_id, role, content, metadata))
+
+    def clear(self, conversation_id: str) -> None:
+        self.history.clear()
 
 
 class DummyCache:
@@ -68,3 +84,24 @@ class SequenceRouter:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._embeddings[0] for _ in texts]
+
+
+def build_test_agent(
+    *,
+    router: Any,
+    memory: Any | None = None,
+    cache: Any | None = None,
+    registry: ToolRegistry | None = None,
+    breaker: Any | None = None,
+) -> AgentLoop:
+    return AgentLoop(
+        prompt_builder=PromptBuilder(),
+        query_rewriter=QueryRewriter(),
+        schema_builder=SchemaContextBuilder(),
+        memory=memory or DummyMemory(),
+        cache=cache or CacheMemory(),
+        work_memory=WorkMemory(),
+        registry=registry or ToolRegistry(),
+        router=router,
+        breaker=breaker or DummyBreaker(),
+    )

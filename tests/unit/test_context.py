@@ -84,7 +84,7 @@ async def test_schema_context_prefers_semantic_search(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("ai_data_agent.context.schema_context.warehouse.get_table_names", get_table_names)
     monkeypatch.setattr("ai_data_agent.context.schema_context.warehouse.get_table_schema", get_table_schema)
-    monkeypatch.setattr("ai_data_agent.context.schema_context.get_router", lambda: type("R", (), {"embed": embed})())
+    monkeypatch.setattr("ai_data_agent.context.schema_context.get_router", lambda: type("R", (), {"embed": staticmethod(embed)})())
     monkeypatch.setattr(
         "ai_data_agent.context.schema_context.vector_store.search_schema",
         lambda query_embedding, top_k: [{"metadata": {"table_name": "orders"}, "score": 0.9}],

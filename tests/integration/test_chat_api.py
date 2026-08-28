@@ -26,7 +26,13 @@ class FakeAgent:
     def __init__(self, response: AgentResponse) -> None:
         self._response = response
 
-    async def run(self, query: str, conversation_id: str, use_cache: bool = True) -> AgentResponse:
+    async def run(
+        self,
+        query: str,
+        conversation_id: str,
+        request_context=None,
+        use_cache: bool = True,
+    ) -> AgentResponse:
         return self._response
 
 
@@ -58,11 +64,16 @@ async def test_chat_api_success() -> None:
 @pytest.mark.asyncio
 async def test_chat_api_validation_error() -> None:
     # query 为空时应由 Pydantic/FastAPI 返回 422。
+    # 需要 override _get_agent_loop，避免容器未启动时依赖解析失败先于 body 校验报错。
     app = create_app()
+    app.dependency_overrides[chat_api._get_agent_loop] = lambda: FakeAgent(
+        AgentResponse(answer="", conversation_id="", success=True)
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post("/api/v1/chat", json={"query": ""})
 
+    app.dependency_overrides.clear()
     assert resp.status_code == 422
 
 

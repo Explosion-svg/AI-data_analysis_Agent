@@ -43,12 +43,16 @@ GROUPS: dict[str, list[str]] = {
         "tests/unit/test_benchmark_dataset.py",
         "tests/integration/test_evaluation.py",
     ],
+    "load": [
+        "tests/unit/test_orchestration.py",
+        "tests/integration/test_main.py",
+    ],
     "all": ["tests"],
 }
 
 
 def print_usage() -> None:
-    print("用法: python3 run_tests.py [unit|integration|infra|evaluation|all] [-v]")
+    print("用法: python3 run_tests.py [unit|integration|infra|evaluation|load|all] [-v]")
     print("")
     print("示例:")
     print("  python3 run_tests.py unit")

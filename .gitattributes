@@ -1,0 +1,13 @@
+# Normalize line endings: LF in repo, checkout as-is on Linux/macOS, CRLF-safe on Windows
+* text=auto eol=lf
+
+# Windows scripts keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files - no line ending conversion
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
+*.parquet binary

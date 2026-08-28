@@ -23,7 +23,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def reset_singletons() -> None:
     from ai_data_agent import assembler
-    from ai_data_agent.memory import cache_memory, conversation_memory
+    from ai_data_agent.memory import cache_memory, conversation_memory, work_memory
     from ai_data_agent.model_gateway import router
     from ai_data_agent.reliability import circuit_breaker
     from ai_data_agent.tools import tool_registry
@@ -31,6 +31,7 @@ def reset_singletons() -> None:
     assembler._container = None
     cache_memory._cache = None
     conversation_memory._memory = None
+    work_memory._work_memory = None
     router._router = None
     tool_registry._registry = None
     circuit_breaker._breakers.clear()

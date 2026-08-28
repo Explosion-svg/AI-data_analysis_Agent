@@ -96,6 +96,17 @@ OPENAI_FAST_MODEL=gpt-4o-mini
 
 如果你使用本地或其他提供方，按 `ai_data_agent/config/config.py` 中的字段名配置即可。
 
+单实例的初始生产并发参数可以直接参考 `.env.example` 中的 `Concurrency / Bulkhead`
+和 `Memory / Cache` 段落。当前推荐起步值已经包含：
+
+- `AGENT_REQUEST_CONCURRENCY=64`
+- `LLM_CONCURRENCY=16`
+- `SQL_TOOL_CONCURRENCY=16`
+- `RAG_TOOL_CONCURRENCY=16`
+- `CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS=1.0`
+- `MEMORY_BACKEND=redis`
+- `CACHE_BACKEND=redis`
+
 ### 3. Run
 
 ```bash
@@ -151,6 +162,33 @@ pytest
 ```bash
 python run_tests.py
 ```
+
+## Load Test
+
+项目内置了一个最小压测脚本：
+
+```bash
+python run_load_test.py --mode asgi --requests 200 --concurrency 50 --fake-latency-ms 100
+```
+
+如果你已经启动了真实服务：
+
+```bash
+python run_load_test.py --mode http --url http://127.0.0.1:8000 --requests 500 --concurrency 100
+```
+
+建议压测时重点关注：
+
+- `success / failures`
+- `status_counts` 中是否开始出现大量 `503`
+- `latency_p95_ms`
+- `latency_p99_ms`
+
+调参原则：
+
+- `503` 很多且 CPU/外部依赖未满时，适当提高 `AGENT_REQUEST_CONCURRENCY`
+- `p95/p99` 明显恶化时，优先下调 `LLM_CONCURRENCY` 或高成本工具并发
+- Redis 冲突增多时，优先减少单会话热点写入或增加实例数，而不是盲目继续提并发
 
 ## Related Docs
 
