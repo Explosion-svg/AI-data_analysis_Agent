@@ -25,7 +25,8 @@ tools/python_tool.py — Python 代码沙盒执行工具（PythonTool）
   3. 资源限制（POSIX）：
      worker 启动时通过 resource.setrlimit 设置：
      - RLIMIT_CPU：硬限制 CPU 时间（timeout + 余量）
-     - RLIMIT_AS：虚拟内存上限（512MB，防 [0]*10**10 类内存炸弹）
+     - RLIMIT_AS：虚拟内存上限（2048MB，防 [0]*10**10 类内存炸弹；
+       numpy/OpenBLAS 导入基线 VSZ 约 600MB+，故须先预导入再施加限制）
      - RLIMIT_FSIZE：文件写入上限（10MB）
      - RLIMIT_NPROC：禁止再 fork 子进程
      Windows 无 rlimit 机制，依赖 kill-on-timeout + 输出上限。
@@ -198,10 +199,17 @@ def _apply_limits(timeout):
         return
     try:
         import resource
+        # RLIMIT_AS 限制虚拟内存（VSZ）而非实际占用（RSS）：
+        # numpy/OpenBLAS 导入本身 VSZ 约 600MB+（线程栈与预留缓冲随核数增长），
+        # 512MB 连导入都不够（Linux 上表现为 KeyboardInterrupt，CI 复现过）。
+        # 2048MB = 导入基线之上留约 1.4GB 用户数据空间，同时拦截失控分配
+        # （实测 3GB 分配被 MemoryError 拦截）。
+        resource.setrlimit(resource.RLIMIT_AS, (2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024))
         cpu = max(1, int(timeout) + 5)
         resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
+        # NPROC=0 阻断 fork（实测 EAGAIN）；本内核上同时阻断新线程创建，
+        # 属可接受的沙箱约束（OpenBLAS 线程池在导入期已建好，不受影响）
         resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
     except Exception:
         pass
@@ -212,6 +220,11 @@ def main():
     code = payload["code"]
     data = payload.get("data")
     timeout = payload.get("timeout") or 20.0
+    # 预导入重型依赖，必须在 _apply_limits 之前：
+    # RLIMIT_AS / RLIMIT_NPROC 施加后 numpy 导入会直接失败（KeyboardInterrupt）。
+    # 预导入后用户代码 import pandas/numpy 命中 sys.modules 缓存，零成本。
+    import pandas  # noqa: F401
+    import numpy  # noqa: F401
     _apply_limits(timeout)
 
     buf = io.StringIO()
